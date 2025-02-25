@@ -1,0 +1,127 @@
+# Build directories
+/build/
+/bin/
+/lib/
+/out/
+/cmake-build-*/
+/CMakeFiles/
+/Debug/
+/Release/
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+*.ko
+*.elf
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+simplessd-standalone
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Generated files
+*.d
+*.gcda
+*.gcno
+*.gcov
+
+# Dependency directories
+/deps/
+/vendor/
+
+# IDE specific files
+## Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj*
+
+## Visual Studio Code
+.vscode/
+*.code-workspace
+.history/
+
+## JetBrains IDEs (CLion, etc.)
+.idea/
+*.iml
+*.iws
+*.ipr
+cmake-build-*/
+
+## Eclipse
+.project
+.cproject
+.settings/
+
+# OS specific files
+## macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+## Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+## Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# SimpleSSD specific files
+/output/
+*.log
+*.txt
+*.csv
+*.dat
+*.bin
+libmcpat.a
+libsimplessd.a
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Temporary files
+*.swp
+*.swo
+*.tmp
+*.bak
