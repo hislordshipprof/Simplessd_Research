@@ -38,6 +38,15 @@ const char NAME_GC_RECLAIM_THRESHOLD[] = "GCReclaimThreshold";
 const char NAME_GC_EVICT_POLICY[] = "EvictPolicy";
 const char NAME_GC_D_CHOICE_PARAM[] = "DChoiceParam";
 const char NAME_USE_RANDOM_IO_TWEAK[] = "EnableRandomIOTweak";
+const char NAME_ENABLE_RL_GC[] = "EnableRLGC";
+const char NAME_RL_GC_TGC_THRESHOLD[] = "RLGCTgcThreshold";
+const char NAME_RL_GC_TIGC_THRESHOLD[] = "RLGCTigcThreshold";
+const char NAME_RL_GC_MAX_PAGE_COPIES[] = "RLGCMaxPageCopies";
+const char NAME_RL_GC_LEARNING_RATE[] = "RLGCLearningRate";
+const char NAME_RL_GC_DISCOUNT_FACTOR[] = "RLGCDiscountFactor";
+const char NAME_RL_GC_INIT_EPSILON[] = "RLGCInitEpsilon";
+const char NAME_RL_GC_NUM_ACTIONS[] = "RLGCNumActions";
+const char NAME_RL_GC_DEBUG_ENABLE[] = "RLGCDebugEnable";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
@@ -53,6 +62,15 @@ Config::Config() {
   evictPolicy = POLICY_GREEDY;
   dChoiceParam = 3;
   randomIOTweak = true;
+  enableRLGC = false;
+  rlGCTgcThreshold = 10;
+  rlGCTigcThreshold = 3;
+  rlGCMaxPageCopies = 2;
+  rlGCLearningRate = 0.3f;
+  rlGCDiscountFactor = 0.8f;
+  rlGCInitEpsilon = 0.8f;
+  rlGCNumActions = 7;
+  rlGCDebugEnable = false;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -96,6 +114,33 @@ bool Config::setConfig(const char *name, const char *value) {
   }
   else if (MATCH_NAME(NAME_USE_RANDOM_IO_TWEAK)) {
     randomIOTweak = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_ENABLE_RL_GC)) {
+    enableRLGC = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_TGC_THRESHOLD)) {
+    rlGCTgcThreshold = (uint32_t)strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_TIGC_THRESHOLD)) {
+    rlGCTigcThreshold = (uint32_t)strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_MAX_PAGE_COPIES)) {
+    rlGCMaxPageCopies = (uint32_t)strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_LEARNING_RATE)) {
+    rlGCLearningRate = strtof(value, nullptr);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_DISCOUNT_FACTOR)) {
+    rlGCDiscountFactor = strtof(value, nullptr);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_INIT_EPSILON)) {
+    rlGCInitEpsilon = strtof(value, nullptr);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_NUM_ACTIONS)) {
+    rlGCNumActions = (uint32_t)strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_RL_GC_DEBUG_ENABLE)) {
+    rlGCDebugEnable = convertBool(value);
   }
   else {
     ret = false;
@@ -156,6 +201,18 @@ uint64_t Config::readUint(uint32_t idx) {
     case FTL_GC_D_CHOICE_PARAM:
       ret = dChoiceParam;
       break;
+    case FTL_RL_GC_TGC_THRESHOLD:
+      ret = rlGCTgcThreshold;
+      break;
+    case FTL_RL_GC_TIGC_THRESHOLD:
+      ret = rlGCTigcThreshold;
+      break;
+    case FTL_RL_GC_MAX_PAGE_COPIES:
+      ret = rlGCMaxPageCopies;
+      break;
+    case FTL_RL_GC_NUM_ACTIONS:
+      ret = rlGCNumActions;
+      break;
   }
 
   return ret;
@@ -180,6 +237,15 @@ float Config::readFloat(uint32_t idx) {
     case FTL_GC_RECLAIM_THRESHOLD:
       ret = reclaimThreshold;
       break;
+    case FTL_RL_GC_LEARNING_RATE:
+      ret = rlGCLearningRate;
+      break;
+    case FTL_RL_GC_DISCOUNT_FACTOR:
+      ret = rlGCDiscountFactor;
+      break;
+    case FTL_RL_GC_INIT_EPSILON:
+      ret = rlGCInitEpsilon;
+      break;
   }
 
   return ret;
@@ -191,6 +257,12 @@ bool Config::readBoolean(uint32_t idx) {
   switch (idx) {
     case FTL_USE_RANDOM_IO_TWEAK:
       ret = randomIOTweak;
+      break;
+    case FTL_RL_GC_ENABLE:
+      ret = enableRLGC;
+      break;
+    case FTL_RL_GC_DEBUG_ENABLE:
+      ret = rlGCDebugEnable;
       break;
   }
 

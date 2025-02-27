@@ -45,6 +45,17 @@ typedef enum {
   /* N+K Mapping configuration*/
   FTL_NKMAP_N,
   FTL_NKMAP_K,
+
+  /* RL GC parameters */
+  FTL_RL_GC_ENABLE,            // Whether to enable RL-based GC
+  FTL_RL_GC_TGC_THRESHOLD,     // Free block threshold for GC triggering
+  FTL_RL_GC_TIGC_THRESHOLD,    // Free block threshold for intensive GC
+  FTL_RL_GC_MAX_PAGE_COPIES,   // Maximum page copies per action
+  FTL_RL_GC_LEARNING_RATE,     // Learning rate (alpha)
+  FTL_RL_GC_DISCOUNT_FACTOR,   // Discount factor (gamma)
+  FTL_RL_GC_INIT_EPSILON,      // Initial exploration rate (epsilon)
+  FTL_RL_GC_NUM_ACTIONS,       // Number of actions in action space
+  FTL_RL_GC_DEBUG_ENABLE,      // Enable debug output for RL-GC
 } FTL_CONFIG;
 
 typedef enum {
@@ -84,6 +95,17 @@ class Config : public BaseConfig {
   EVICT_POLICY evictPolicy;    //!< Default: POLICY_GREEDY
   uint64_t dChoiceParam;       //!< Default: 3
   bool randomIOTweak;          //!< Default: true
+
+  // Add these new variables
+  bool enableRLGC;              //!< Default: false
+  uint32_t rlGCTgcThreshold;    //!< Default: 10
+  uint32_t rlGCTigcThreshold;   //!< Default: 3
+  uint32_t rlGCMaxPageCopies;   //!< Default: 2
+  float rlGCLearningRate;       //!< Default: 0.3
+  float rlGCDiscountFactor;     //!< Default: 0.8
+  float rlGCInitEpsilon;        //!< Default: 0.8
+  uint32_t rlGCNumActions;      //!< Default: 7
+  bool rlGCDebugEnable;         //!< Default: false
 
  public:
   Config();

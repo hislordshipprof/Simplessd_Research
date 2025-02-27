@@ -1,0 +1,7 @@
+---
+description: code correctness
+globs: 
+---
+
+# Your rule content
+Always make  sure you dont destroy exsting working code but also handle the given part of the code which is not working

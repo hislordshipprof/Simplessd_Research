@@ -28,6 +28,7 @@
 #include "ftl/common/block.hh"
 #include "ftl/ftl.hh"
 #include "pal/pal.hh"
+#include "ftl/rl_gc/rl_gc.hh"
 
 namespace SimpleSSD {
 
@@ -59,6 +60,12 @@ class PageMapping : public AbstractFTL {
     uint64_t validPageCopies;
   } stat;
 
+  RLGarbageCollector *pRLGC;
+  bool bEnableRLGC;
+  
+  uint64_t lastIOStartTime;
+  uint64_t lastIOEndTime;
+
   float freeBlockRatio();
   uint32_t convertBlockIdx(uint32_t);
   uint32_t getFreeBlock(uint32_t);
@@ -75,6 +82,8 @@ class PageMapping : public AbstractFTL {
   void writeInternal(Request &, uint64_t &, bool = true);
   void trimInternal(Request &, uint64_t &);
   void eraseInternal(PAL::Request &, uint64_t &);
+
+  uint32_t performPartialGC(uint32_t pagesToCopy, std::vector<uint32_t> &victimBlocks, uint64_t &tick);
 
  public:
   PageMapping(ConfigReader &, Parameter &, PAL::PAL *, DRAM::AbstractDRAM *);

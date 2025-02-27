@@ -20,6 +20,11 @@
 #include "ftl/page_mapping.hh"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <functional>
 #include <limits>
 #include <random>
 
@@ -60,9 +65,68 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
 
   bRandomTweak = conf.readBoolean(CONFIG_FTL, FTL_USE_RANDOM_IO_TWEAK);
   bitsetSize = bRandomTweak ? param.ioUnitInPage : 1;
+
+  // Initialize RL-GC
+  bEnableRLGC = conf.readBoolean(CONFIG_FTL, FTL_RL_GC_ENABLE);
+  
+  if (bEnableRLGC) {
+    uint32_t tgcThreshold = conf.readUint(CONFIG_FTL, FTL_RL_GC_TGC_THRESHOLD);
+    uint32_t tigcThreshold = conf.readUint(CONFIG_FTL, FTL_RL_GC_TIGC_THRESHOLD);
+    uint32_t maxPageCopies = conf.readUint(CONFIG_FTL, FTL_RL_GC_MAX_PAGE_COPIES);
+    float learningRate = conf.readFloat(CONFIG_FTL, FTL_RL_GC_LEARNING_RATE);
+    float discountFactor = conf.readFloat(CONFIG_FTL, FTL_RL_GC_DISCOUNT_FACTOR);
+    float initEpsilon = conf.readFloat(CONFIG_FTL, FTL_RL_GC_INIT_EPSILON);
+    uint32_t numActions = conf.readUint(CONFIG_FTL, FTL_RL_GC_NUM_ACTIONS);
+    
+    pRLGC = new RLGarbageCollector(tgcThreshold, tigcThreshold, maxPageCopies,
+                                  learningRate, discountFactor, initEpsilon, numActions);
+    
+    // Enable debug output for RL-GC
+    bool enableDebug = conf.readBoolean(CONFIG_FTL, FTL_RL_GC_DEBUG_ENABLE);
+    if (enableDebug) {
+      std::string debugPath = "output/rl_gc_debug.log";
+      
+      // Create output directory if it doesn't exist
+      #ifdef _WIN32
+      // Windows
+      if (system("if not exist output mkdir output") != 0) {
+        std::cerr << "Warning: Failed to create output directory" << std::endl;
+      }
+      #else
+      // Linux/Unix/MacOS
+      if (system("mkdir -p output") != 0) {
+        std::cerr << "Warning: Failed to create output directory" << std::endl;
+      }
+      #endif
+      
+      // Clear existing log file
+      std::ofstream logFile(debugPath, std::ios::trunc);
+      if (logFile.is_open()) {
+        logFile.close();
+      }
+      
+      // Enable debug in RL-GC
+      pRLGC->enableDebug(true);
+      pRLGC->setDebugFilePath(debugPath);
+      
+      // Print initial debug info
+      pRLGC->printDebugInfo();
+    }
+  }
+  else {
+    pRLGC = nullptr;
+  }
+  
+  lastIOStartTime = 0;
+  lastIOEndTime = 0;
 }
 
-PageMapping::~PageMapping() {}
+PageMapping::~PageMapping() {
+  // Clean up RL-GC
+  if (pRLGC) {
+    delete pRLGC;
+  }
+}
 
 bool PageMapping::initialize() {
   uint64_t nPagesToWarmup;
@@ -184,39 +248,106 @@ bool PageMapping::initialize() {
 }
 
 void PageMapping::read(Request &req, uint64_t &tick) {
-  uint64_t begin = tick;
-
+  lastIOStartTime = tick;
+  
+  // Call original read logic
+  uint64_t beginAt = tick;
+  
   if (req.ioFlag.count() > 0) {
     readInternal(req, tick);
 
     debugprint(LOG_FTL_PAGE_MAPPING,
                "READ  | LPN %" PRIu64 " | %" PRIu64 " - %" PRIu64 " (%" PRIu64
                ")",
-               req.lpn, begin, tick, tick - begin);
+               req.lpn, beginAt, tick, tick - beginAt);
   }
   else {
     warn("FTL got empty request");
   }
 
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::READ);
+  
+  // Record IO completion time
+  lastIOEndTime = tick;
+  
+  // If RL-GC is enabled, record response time for reward calculation
+  if (bEnableRLGC && pRLGC) {
+    uint64_t responseTime = lastIOEndTime - lastIOStartTime;
+    pRLGC->recordResponseTime(responseTime);
+    
+    // Only check for GC if we have a valid RL-GC controller and free blocks are below threshold
+    if (nFreeBlocks <= pRLGC->getTGCThreshold()) {
+      // Check if we should trigger GC based on inter-request interval
+      if (pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
+        // Get the action to take
+        uint32_t action = pRLGC->getGCAction(nFreeBlocks);
+        
+        // Perform partial GC based on the action
+        std::vector<uint32_t> victimBlocks;
+        performPartialGC(action, victimBlocks, tick);
+      }
+    }
+  }
 }
 
 void PageMapping::write(Request &req, uint64_t &tick) {
-  uint64_t begin = tick;
-
+  lastIOStartTime = tick;
+  
   if (req.ioFlag.count() > 0) {
     writeInternal(req, tick);
 
     debugprint(LOG_FTL_PAGE_MAPPING,
                "WRITE | LPN %" PRIu64 " | %" PRIu64 " - %" PRIu64 " (%" PRIu64
                ")",
-               req.lpn, begin, tick, tick - begin);
+               req.lpn, lastIOStartTime, tick, tick - lastIOStartTime);
   }
   else {
     warn("FTL got empty request");
   }
 
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::WRITE);
+  
+  // Record IO completion time
+  lastIOEndTime = tick;
+  
+  // Check if we need to do garbage collection
+  bool needGC = bReclaimMore || nFreeBlocks <= conf.readUint(CONFIG_FTL, FTL_RL_GC_TGC_THRESHOLD);
+  
+  if (needGC) {
+    if (bEnableRLGC && pRLGC) {
+      uint64_t responseTime = lastIOEndTime - lastIOStartTime;
+      pRLGC->recordResponseTime(responseTime);
+      
+      // Check if we should trigger GC based on inter-request interval
+      if (pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
+        // Get the action to take
+        uint32_t action = pRLGC->getGCAction(nFreeBlocks);
+        
+        // Perform partial GC based on the action
+        std::vector<uint32_t> victimBlocks;
+        uint32_t copiedPages = performPartialGC(action, victimBlocks, tick);
+        
+        // Record GC invocation
+        pRLGC->recordGCInvocation(copiedPages);
+        
+        // Update Q-value based on response time
+        pRLGC->updateQValue(responseTime);
+      }
+      else if (nFreeBlocks <= pRLGC->getTIGCThreshold()) {
+        // Critical situation - perform intensive GC
+        std::vector<uint32_t> victimBlocks;
+        doGarbageCollection(victimBlocks, tick);
+        
+        // Record intensive GC
+        pRLGC->recordIntensiveGC();
+      }
+    }
+    else {
+      // Use original GC implementation
+      std::vector<uint32_t> victimBlocks;
+      doGarbageCollection(victimBlocks, tick);
+    }
+  }
 }
 
 void PageMapping::trim(Request &req, uint64_t &tick) {
@@ -490,138 +621,125 @@ void PageMapping::selectVictimBlock(std::vector<uint32_t> &list,
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::SELECT_VICTIM_BLOCK);
 }
 
-void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
-                                      uint64_t &tick) {
-  PAL::Request req(param.ioUnitInPage);
-  std::vector<PAL::Request> readRequests;
-  std::vector<PAL::Request> writeRequests;
-  std::vector<PAL::Request> eraseRequests;
-  std::vector<uint64_t> lpns;
-  Bitset bit(param.ioUnitInPage);
-  uint64_t beginAt;
-  uint64_t readFinishedAt = tick;
-  uint64_t writeFinishedAt = tick;
-  uint64_t eraseFinishedAt = tick;
-
-  if (blocksToReclaim.size() == 0) {
-    return;
+void PageMapping::doGarbageCollection(std::vector<uint32_t> &victimBlocks, uint64_t &tick) {
+  // Use original GC implementation
+  
+  // Select victim blocks if not provided
+  if (victimBlocks.size() == 0) {
+    uint64_t tickLocal = tick;
+    selectVictimBlock(victimBlocks, tickLocal);
   }
-
-  // For all blocks to reclaim, collecting request structure only
-  for (auto &iter : blocksToReclaim) {
-    auto block = blocks.find(iter);
-
-    if (block == blocks.end()) {
-      panic("Invalid block");
+  
+  // Process each victim block
+  for (auto &victimBlockID : victimBlocks) {
+    auto blockIter = blocks.find(victimBlockID);
+    
+    // Skip if block doesn't exist
+    if (blockIter == blocks.end()) {
+      continue;
     }
-
-    // Copy valid pages to free block
+    
+    Block &victimBlock = blockIter->second;
+    
+    // Skip blocks with no valid pages
+    if (victimBlock.getValidPageCount() == 0) {
+      // Just erase the block
+      PAL::Request req(param.ioUnitInPage);
+      req.blockIndex = victimBlockID;
+      eraseInternal(req, tick);
+      continue;
+    }
+    
     for (uint32_t pageIndex = 0; pageIndex < param.pagesInBlock; pageIndex++) {
-      // Valid?
-      if (block->second.getPageInfo(pageIndex, lpns, bit)) {
-        if (!bRandomTweak) {
-          bit.set();
+      // Initialize vectors and bitset with proper sizes before calling getPageInfo
+      std::vector<uint64_t> lpns(param.ioUnitInPage);
+      Bitset validBits(param.ioUnitInPage);
+      
+      // Get page info safely
+      bool hasValidData = victimBlock.getPageInfo(pageIndex, lpns, validBits);
+      
+      // Skip if no valid data or no valid bits
+      if (!hasValidData || !validBits.any()) {
+        continue;
+      }
+      
+      // Get logical page number from the first valid bit
+      uint64_t lpn = UINT64_MAX;
+      for (uint32_t i = 0; i < validBits.size(); i++) {
+        if (validBits.test(i)) {
+          lpn = lpns[i];
+          break;
         }
-
-        // Retrive free block
-        auto freeBlock = blocks.find(getLastFreeBlock(bit));
-
-        // Issue Read
-        req.blockIndex = block->first;
-        req.pageIndex = pageIndex;
-        req.ioFlag = bit;
-
-        readRequests.push_back(req);
-
-        // Update mapping table
-        uint32_t newBlockIdx = freeBlock->first;
-
+      }
+      
+      if (lpn == UINT64_MAX) {
+        continue;
+      }
+      
+      // Allocate a new page
+      uint32_t newBlockID = getLastFreeBlock(validBits);
+      auto newBlockIter = blocks.find(newBlockID);
+      if (newBlockIter == blocks.end()) {
+        panic("New block not found");
+      }
+      uint32_t newPageID = newBlockIter->second.getNextWritePageIndex();
+      
+      // Copy the page data (read from old, write to new)
+      PAL::Request palRequest(param.ioUnitInPage);
+      palRequest.blockIndex = victimBlockID;
+      palRequest.pageIndex = pageIndex;
+      palRequest.ioFlag = validBits;
+      
+      // Read from old location
+      pPAL->read(palRequest, tick);
+      
+      // Write to new location
+      palRequest.blockIndex = newBlockID;
+      palRequest.pageIndex = newPageID;
+      pPAL->write(palRequest, tick);
+      
+      // Update mapping table
+      auto mappingList = table.find(lpn);
+      if (mappingList != table.end()) {
         for (uint32_t idx = 0; idx < bitsetSize; idx++) {
-          if (bit.test(idx)) {
-            // Invalidate
-            block->second.invalidate(pageIndex, idx);
-
-            auto mappingList = table.find(lpns.at(idx));
-
-            if (mappingList == table.end()) {
-              panic("Invalid mapping table entry");
-            }
-
-            pDRAM->read(&(*mappingList), 8 * param.ioUnitInPage, tick);
-
-            auto &mapping = mappingList->second.at(idx);
-
-            uint32_t newPageIdx = freeBlock->second.getNextWritePageIndex(idx);
-
-            mapping.first = newBlockIdx;
-            mapping.second = newPageIdx;
-
-            freeBlock->second.write(newPageIdx, lpns.at(idx), idx, beginAt);
-
-            // Issue Write
-            req.blockIndex = newBlockIdx;
-            req.pageIndex = newPageIdx;
-
-            if (bRandomTweak) {
-              req.ioFlag.reset();
-              req.ioFlag.set(idx);
-            }
-            else {
-              req.ioFlag.set();
-            }
-
-            writeRequests.push_back(req);
-
-            stat.validPageCopies++;
+          if (validBits.test(idx)) {
+            mappingList->second.at(idx).first = newBlockID;
+            mappingList->second.at(idx).second = newPageID;
           }
         }
-
-        stat.validSuperPageCopies++;
       }
+      
+      // Invalidate the old page
+      for (uint32_t idx = 0; idx < bitsetSize; idx++) {
+        if (validBits.test(idx)) {
+          victimBlock.invalidate(pageIndex, idx);
+        }
+      }
+      
+      stat.validPageCopies++;
     }
-
-    // Erase block
-    req.blockIndex = block->first;
-    req.pageIndex = 0;
-    req.ioFlag.set();
-
-    eraseRequests.push_back(req);
+    
+    // Erase the block if all valid pages were copied
+    if (victimBlock.getValidPageCount() == 0) {
+      PAL::Request req(param.ioUnitInPage);
+      req.blockIndex = victimBlockID;
+      eraseInternal(req, tick);
+    }
   }
-
-  // Do actual I/O here
-  // This handles PAL2 limitation (SIGSEGV, infinite loop, or so-on)
-  for (auto &iter : readRequests) {
-    beginAt = tick;
-
-    pPAL->read(iter, beginAt);
-
-    readFinishedAt = MAX(readFinishedAt, beginAt);
+  
+  // Update statistics
+  stat.gcCount++;
+  stat.reclaimedBlocks += victimBlocks.size();
+  
+  // If RL-GC is enabled, track state
+  if (bEnableRLGC && pRLGC) {
+    pRLGC->updateState(tick);
   }
-
-  for (auto &iter : writeRequests) {
-    beginAt = readFinishedAt;
-
-    pPAL->write(iter, beginAt);
-
-    writeFinishedAt = MAX(writeFinishedAt, beginAt);
-  }
-
-  for (auto &iter : eraseRequests) {
-    beginAt = readFinishedAt;
-
-    eraseInternal(iter, beginAt);
-
-    eraseFinishedAt = MAX(eraseFinishedAt, beginAt);
-  }
-
-  tick = MAX(writeFinishedAt, eraseFinishedAt);
-  tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::DO_GARBAGE_COLLECTION);
 }
 
 void PageMapping::readInternal(Request &req, uint64_t &tick) {
   PAL::Request palRequest(req);
   uint64_t beginAt;
-  uint64_t finishedAt = tick;
 
   auto mappingList = table.find(req.lpn);
 
@@ -660,13 +778,11 @@ void PageMapping::readInternal(Request &req, uint64_t &tick) {
 
           block->second.read(palRequest.pageIndex, idx, beginAt);
           pPAL->read(palRequest, beginAt);
-
-          finishedAt = MAX(finishedAt, beginAt);
         }
       }
     }
 
-    tick = finishedAt;
+    tick = beginAt;
     tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::READ_INTERNAL);
   }
 }
@@ -675,9 +791,8 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
   PAL::Request palRequest(req);
   std::unordered_map<uint32_t, Block>::iterator block;
   auto mappingList = table.find(req.lpn);
-  uint64_t beginAt;
-  uint64_t finishedAt = tick;
   bool readBeforeWrite = false;
+  uint64_t beginAt = tick;  // Declare beginAt at this scope level
 
   if (mappingList != table.end()) {
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
@@ -736,7 +851,7 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
       uint32_t pageIndex = block->second.getNextWritePageIndex(idx);
       auto &mapping = mappingList->second.at(idx);
 
-      beginAt = tick;
+      uint64_t beginAt = tick;
 
       block->second.write(pageIndex, req.lpn, idx, beginAt);
 
@@ -748,7 +863,6 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
         palRequest.pageIndex = mapping.second;
 
         // We don't need to read old data
-        palRequest.ioFlag = req.ioFlag;
         palRequest.ioFlag.flip();
 
         pPAL->read(palRequest, beginAt);
@@ -772,14 +886,12 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
 
         pPAL->write(palRequest, beginAt);
       }
-
-      finishedAt = MAX(finishedAt, beginAt);
     }
   }
 
   // Exclude CPU operation when initializing
   if (sendToPAL) {
-    tick = finishedAt;
+    tick = beginAt;
     tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::WRITE_INTERNAL);
   }
 
@@ -962,6 +1074,25 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.name = prefix + "page_mapping.wear_leveling";
   temp.desc = "Wear-leveling factor";
   list.push_back(temp);
+
+  // Add RL-GC stats if enabled
+  if (bEnableRLGC) {
+    temp.name = prefix + "ftl.rlgc.gc_invocations";
+    temp.desc = "Number of RL-GC invocations";
+    list.push_back(temp);
+    
+    temp.name = prefix + "ftl.rlgc.page_copies";
+    temp.desc = "Total pages copied during RL-GC";
+    list.push_back(temp);
+    
+    temp.name = prefix + "ftl.rlgc.intensive_gc";
+    temp.desc = "Number of intensive GCs triggered";
+    list.push_back(temp);
+    
+    temp.name = prefix + "ftl.rlgc.avg_reward";
+    temp.desc = "Average reward received by RL-GC";
+    list.push_back(temp);
+  }
 }
 
 void PageMapping::getStatValues(std::vector<double> &values) {
@@ -970,10 +1101,147 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   values.push_back(stat.validSuperPageCopies);
   values.push_back(stat.validPageCopies);
   values.push_back(calculateWearLeveling());
+
+  // Add RL-GC stat values if enabled
+  if (bEnableRLGC) {
+    uint64_t invocations, pageCopies, intensiveGCs;
+    float avgReward;
+    
+    pRLGC->getStats(invocations, pageCopies, intensiveGCs, avgReward);
+    
+    values.push_back(invocations);
+    values.push_back(pageCopies);
+    values.push_back(intensiveGCs);
+    values.push_back(avgReward);
+  }
 }
 
 void PageMapping::resetStatValues() {
   memset(&stat, 0, sizeof(stat));
+
+  // Reset RL-GC stats if enabled
+  if (bEnableRLGC) {
+    pRLGC->resetStats();
+  }
+}
+
+uint32_t PageMapping::performPartialGC(uint32_t pagesToCopy, std::vector<uint32_t> &victimBlocks, uint64_t &tick) {
+  // Safety check - don't try to copy 0 pages
+  if (pagesToCopy == 0) {
+    return 0;
+  }
+  
+  // Track statistics
+  stat.gcCount++;
+  
+  // Select victim blocks
+  if (victimBlocks.size() == 0) {
+    // No victim blocks provided, select them
+    uint64_t tickLocal = tick;
+    
+    // Select victim blocks using the existing method
+    selectVictimBlock(victimBlocks, tickLocal);
+    
+    // If no victims found, return early
+    if (victimBlocks.size() == 0) {
+      return 0;
+    }
+  }
+  
+  uint32_t copiedPages = 0;
+  
+  // Get the first victim block
+  uint32_t victimBlockID = victimBlocks[0];
+  auto blockIter = blocks.find(victimBlockID);
+  
+  // Safety check - make sure block exists
+  if (blockIter == blocks.end()) {
+    return 0;
+  }
+  
+  Block &victimBlock = blockIter->second;
+  
+  // Safety check - make sure block has valid pages
+  if (victimBlock.getValidPageCount() == 0) {
+    // No valid pages to copy, just erase the block
+    PAL::Request req(param.ioUnitInPage);
+    req.blockIndex = victimBlockID;
+    eraseInternal(req, tick);
+    return 0;
+  }
+  
+  // Copy valid pages up to the requested number
+  for (uint32_t pageIndex = 0; pageIndex < param.pagesInBlock && copiedPages < pagesToCopy; pageIndex++) {
+    // First check if the page has any valid data at all to avoid unnecessary processing
+    if (victimBlock.getValidPageCount() == 0) {
+      break;  // No more valid pages in this block
+    }
+    
+    // Initialize vectors and bitset with proper sizes before calling getPageInfo
+    std::vector<uint64_t> lpns(param.ioUnitInPage);
+    Bitset validBits(param.ioUnitInPage);
+    
+    // Get page info safely
+    bool hasValidData = victimBlock.getPageInfo(pageIndex, lpns, validBits);
+    
+    // Skip if no valid data or no valid bits
+    if (!hasValidData || !validBits.any()) {
+      continue;
+    }
+    
+    // Allocate a new page
+    uint32_t newBlockID = getLastFreeBlock(validBits);
+    auto newBlockIter = blocks.find(newBlockID);
+    if (newBlockIter == blocks.end()) {
+      panic("New block not found");
+    }
+    uint32_t newPageID = newBlockIter->second.getNextWritePageIndex();
+    
+    // Copy the page data (read from old, write to new)
+    PAL::Request palRequest(param.ioUnitInPage);
+    palRequest.blockIndex = victimBlockID;
+    palRequest.pageIndex = pageIndex;
+    palRequest.ioFlag = validBits;
+    
+    // Read from old location
+    pPAL->read(palRequest, tick);
+    
+    // Write to new location
+    palRequest.blockIndex = newBlockID;
+    palRequest.pageIndex = newPageID;
+    pPAL->write(palRequest, tick);
+    
+    // Update mapping table for each valid bit
+    for (uint32_t idx = 0; idx < param.ioUnitInPage; idx++) {
+      if (validBits.test(idx)) {
+        uint64_t lpn = lpns[idx];
+        auto mappingList = table.find(lpn);
+        
+        if (mappingList != table.end()) {
+          mappingList->second.at(idx).first = newBlockID;
+          mappingList->second.at(idx).second = newPageID;
+        }
+        
+        // Invalidate the old page
+        victimBlock.invalidate(pageIndex, idx);
+      }
+    }
+    
+    copiedPages++;
+  }
+  
+  // If all valid pages were copied, erase the block
+  if (victimBlock.getValidPageCount() == 0) {
+    PAL::Request req(param.ioUnitInPage);
+    req.blockIndex = victimBlockID;
+    eraseInternal(req, tick);
+  }
+  
+  // Update statistics
+  stat.validPageCopies += copiedPages;
+  
+  // Return the number of copied pages
+  return copiedPages;
 }
 
 }  // namespace FTL
