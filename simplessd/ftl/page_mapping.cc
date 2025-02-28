@@ -275,6 +275,11 @@ void PageMapping::read(Request &req, uint64_t &tick) {
     uint64_t responseTime = lastIOEndTime - lastIOStartTime;
     pRLGC->recordResponseTime(responseTime);
     
+    // Process any pending Q-value updates
+    if (pRLGC->hasPendingQValueUpdate()) {
+      pRLGC->processPendingUpdate(responseTime);
+    }
+    
     // Only check for GC if we have a valid RL-GC controller and free blocks are below threshold
     if (nFreeBlocks <= pRLGC->getTGCThreshold()) {
       // Check if we should trigger GC based on inter-request interval
@@ -310,14 +315,22 @@ void PageMapping::write(Request &req, uint64_t &tick) {
   // Record IO completion time
   lastIOEndTime = tick;
   
+  // If RL-GC is enabled, record response time for reward calculation
+  if (bEnableRLGC && pRLGC) {
+    uint64_t responseTime = lastIOEndTime - lastIOStartTime;
+    pRLGC->recordResponseTime(responseTime);
+    
+    // Process any pending Q-value updates
+    if (pRLGC->hasPendingQValueUpdate()) {
+      pRLGC->processPendingUpdate(responseTime);
+    }
+  }
+  
   // Check if we need to do garbage collection
   bool needGC = bReclaimMore || nFreeBlocks <= conf.readUint(CONFIG_FTL, FTL_RL_GC_TGC_THRESHOLD);
   
   if (needGC) {
     if (bEnableRLGC && pRLGC) {
-      uint64_t responseTime = lastIOEndTime - lastIOStartTime;
-      pRLGC->recordResponseTime(responseTime);
-      
       // Check if we should trigger GC based on inter-request interval
       if (pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
         // Get the action to take
@@ -329,9 +342,6 @@ void PageMapping::write(Request &req, uint64_t &tick) {
         
         // Record GC invocation
         pRLGC->recordGCInvocation(copiedPages);
-        
-        // Update Q-value based on response time
-        pRLGC->updateQValue(responseTime);
       }
       else if (nFreeBlocks <= pRLGC->getTIGCThreshold()) {
         // Critical situation - perform intensive GC
@@ -376,10 +386,18 @@ void PageMapping::format(LPNRange &range, uint64_t &tick) {
       // Do trim
       for (uint32_t idx = 0; idx < bitsetSize; idx++) {
         auto &mapping = mappingList.at(idx);
+        
+        // Check if the mapping is valid
+        if (mapping.first >= param.totalPhysicalBlocks ||
+            mapping.second >= param.pagesInBlock) {
+          continue;
+        }
+        
         auto block = blocks.find(mapping.first);
 
         if (block == blocks.end()) {
-          panic("Block is not in use");
+          // Skip if block doesn't exist
+          continue;
         }
 
         block->second.invalidate(mapping.second, idx);
@@ -739,7 +757,7 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &victimBlocks, uint6
 
 void PageMapping::readInternal(Request &req, uint64_t &tick) {
   PAL::Request palRequest(req);
-  uint64_t beginAt;
+  uint64_t beginAt = tick;  // Initialize beginAt to the current tick
 
   auto mappingList = table.find(req.lpn);
 
@@ -755,8 +773,17 @@ void PageMapping::readInternal(Request &req, uint64_t &tick) {
       if (req.ioFlag.test(idx) || !bRandomTweak) {
         auto &mapping = mappingList->second.at(idx);
 
+        // Check if the mapping is valid before proceeding
         if (mapping.first < param.totalPhysicalBlocks &&
             mapping.second < param.pagesInBlock) {
+          
+          // Check if the block exists in the blocks map
+          auto block = blocks.find(mapping.first);
+          if (block == blocks.end()) {
+            // Skip this mapping if the block doesn't exist
+            continue;
+          }
+
           palRequest.blockIndex = mapping.first;
           palRequest.pageIndex = mapping.second;
 
@@ -768,13 +795,7 @@ void PageMapping::readInternal(Request &req, uint64_t &tick) {
             palRequest.ioFlag.set();
           }
 
-          auto block = blocks.find(palRequest.blockIndex);
-
-          if (block == blocks.end()) {
-            panic("Block is not in use");
-          }
-
-          beginAt = tick;
+          beginAt = tick;  // Update beginAt before each read operation
 
           block->second.read(palRequest.pageIndex, idx, beginAt);
           pPAL->read(palRequest, beginAt);
@@ -782,7 +803,7 @@ void PageMapping::readInternal(Request &req, uint64_t &tick) {
       }
     }
 
-    tick = beginAt;
+    tick = beginAt;  // Update tick with the final value of beginAt
     tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::READ_INTERNAL);
   }
 }
@@ -801,7 +822,13 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
 
         if (mapping.first < param.totalPhysicalBlocks &&
             mapping.second < param.pagesInBlock) {
+          // Check if the block exists before trying to invalidate
           block = blocks.find(mapping.first);
+          
+          // Skip if block doesn't exist
+          if (block == blocks.end()) {
+            continue;
+          }
 
           // Invalidate current page
           block->second.invalidate(mapping.second, idx);
@@ -937,10 +964,18 @@ void PageMapping::trimInternal(Request &req, uint64_t &tick) {
     // Do trim
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
       auto &mapping = mappingList->second.at(idx);
+      
+      // Check if the mapping is valid
+      if (mapping.first >= param.totalPhysicalBlocks ||
+          mapping.second >= param.pagesInBlock) {
+        continue;
+      }
+      
       auto block = blocks.find(mapping.first);
 
       if (block == blocks.end()) {
-        panic("Block is not in use");
+        // Skip if block doesn't exist
+        continue;
       }
 
       block->second.invalidate(mapping.second, idx);

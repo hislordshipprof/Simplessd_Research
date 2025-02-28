@@ -62,6 +62,11 @@ class RLGarbageCollector {
   uint32_t tigcThreshold;    // Free block threshold for intensive GC
   uint32_t maxPageCopies;    // Maximum page copies per action
   
+  // Pending Q-value update tracking
+  bool hasPendingUpdate;     // Flag to indicate if there's a pending Q-value update
+  State pendingState;        // State for which the update is pending
+  uint32_t pendingAction;    // Action for which the update is pending
+  
   // Stats
   struct {
     uint64_t gcInvocations;       // Number of GC invocations
@@ -102,6 +107,11 @@ class RLGarbageCollector {
   uint32_t getTIGCThreshold() const;
   uint32_t getMaxPageCopies() const;
   const State& getCurrentState() const;
+  
+  // Pending update methods
+  bool hasPendingQValueUpdate() const { return hasPendingUpdate; }
+  void schedulePendingUpdate(State state, uint32_t action);
+  float processPendingUpdate(uint64_t responseTime);
   
   // Statistics
   void getStats(uint64_t &invocations, uint64_t &pageCopies,

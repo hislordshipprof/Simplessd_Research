@@ -57,6 +57,9 @@ RLGarbageCollector::RLGarbageCollector(uint32_t tgc, uint32_t tigc, uint32_t max
       tgcThreshold(tgc),
       tigcThreshold(tigc),
       maxPageCopies(maxCopies),
+      hasPendingUpdate(false),
+      pendingState(0, 0, 0),
+      pendingAction(0),
       debugEnabled(false),
       debugFilePath("output/rl_gc_debug.log") {
   
@@ -162,6 +165,13 @@ uint32_t RLGarbageCollector::getGCAction(uint32_t freeBlocks) {
     RL_DEBUG_LOG("[RL-GC ACTION] INTENSIVE GC: Using maximum action " 
               << maxPageCopies << " due to critical free blocks (" 
               << freeBlocks << " <= " << tigcThreshold << ")");
+    
+    // Store last action for next state
+    lastAction = maxPageCopies;
+    
+    // Schedule pending update with current state and action
+    schedulePendingUpdate(currentState, lastAction);
+    
     return maxPageCopies;
   }
   
@@ -185,6 +195,9 @@ uint32_t RLGarbageCollector::getGCAction(uint32_t freeBlocks) {
   
   // Store last action for next state
   lastAction = action;
+  
+  // Schedule pending update with current state and action
+  schedulePendingUpdate(currentState, lastAction);
   
   return action;
 }
@@ -303,26 +316,112 @@ float RLGarbageCollector::updateQValue(uint64_t responseTime) {
   return reward;
 }
 
+void RLGarbageCollector::schedulePendingUpdate(State state, uint32_t action) {
+  // Store the state and action for later update
+  hasPendingUpdate = true;
+  pendingState = state;
+  pendingAction = action;
+  
+  RL_DEBUG_LOG("[RL-GC PENDING] Scheduled pending Q-value update:" << std::endl
+            << "  State: (" << state.getPrevIntervalBin() 
+            << "," << state.getCurrIntervalBin() 
+            << "," << state.getPrevActionBin() << ")" << std::endl
+            << "  Action: " << action);
+}
+
+float RLGarbageCollector::processPendingUpdate(uint64_t responseTime) {
+  // Check if there's a pending update
+  if (!hasPendingUpdate) {
+    RL_DEBUG_LOG("[RL-GC PENDING] No pending update to process");
+    return 0.0f;
+  }
+  
+  // Calculate reward based on response time
+  float reward = calculateReward(responseTime);
+  
+  // Create next state based on current intervals
+  State nextState(
+    discretizePrevInterval(prevInterRequestTime),
+    discretizeCurrInterval(currInterRequestTime),
+    discretizeAction(pendingAction)
+  );
+  
+  RL_DEBUG_LOG("[RL-GC PENDING] Processing pending Q-value update:" << std::endl
+            << "  Response time: " << responseTime << "ns" << std::endl
+            << "  Reward: " << std::fixed << std::setprecision(4) << reward << std::endl
+            << "  Pending state: (" << pendingState.getPrevIntervalBin() 
+            << "," << pendingState.getCurrIntervalBin() 
+            << "," << pendingState.getPrevActionBin() << ")" << std::endl
+            << "  Action: " << pendingAction << std::endl
+            << "  Next state: (" << nextState.getPrevIntervalBin() 
+            << "," << nextState.getCurrIntervalBin() 
+            << "," << nextState.getPrevActionBin() << ")");
+  
+  // Update Q-table using the pending state and action
+  qTable.updateQ(pendingState, pendingAction, reward, nextState);
+  
+  // Update statistics
+  stats.avgReward = (stats.avgReward * stats.rewardCount + reward) / (stats.rewardCount + 1);
+  stats.rewardCount++;
+  
+  // Clear pending update
+  hasPendingUpdate = false;
+  
+  // Decay exploration rate
+  qTable.decayEpsilon();
+  
+  return reward;
+}
+
 bool RLGarbageCollector::shouldPerformIntensiveGC(uint32_t freeBlocks) {
   return freeBlocks <= tigcThreshold;
 }
 
 uint32_t RLGarbageCollector::discretizePrevInterval(uint64_t interval) {
-  // Simple discretization - can be improved
-  if (interval == 0) return 0;
-  if (interval < 1000000) return 1;  // < 1ms
-  if (interval < 10000000) return 2; // < 10ms
-  return 3; // >= 10ms
+  // 2 bins as per the paper: "short" if less than 100μs, or "long" otherwise
+  if (interval < 100000) return 0;  // < 100μs (short)
+  return 1;                         // >= 100μs (long)
 }
 
 uint32_t RLGarbageCollector::discretizeCurrInterval(uint64_t interval) {
-  // Same as prev interval for now
-  return discretizePrevInterval(interval);
+  // 17 bins as per the paper for finer granularity
+  if (interval == 0) return 0;
+  
+  // Define thresholds for the 17 bins (in nanoseconds)
+  // These thresholds can be adjusted based on workload characteristics
+  static const uint64_t thresholds[] = {
+    10000,      // 10μs
+    20000,      // 20μs
+    50000,      // 50μs
+    100000,     // 100μs
+    200000,     // 200μs
+    500000,     // 500μs
+    1000000,    // 1ms
+    2000000,    // 2ms
+    5000000,    // 5ms
+    10000000,   // 10ms
+    20000000,   // 20ms
+    50000000,   // 50ms
+    100000000,  // 100ms
+    200000000,  // 200ms
+    500000000,  // 500ms
+    1000000000  // 1s
+  };
+  
+  // Find the appropriate bin
+  for (uint32_t i = 0; i < 16; i++) {
+    if (interval < thresholds[i]) {
+      return i + 1;  // +1 because bin 0 is for interval == 0
+    }
+  }
+  
+  return 17;  // For intervals >= 1s
 }
 
 uint32_t RLGarbageCollector::discretizeAction(uint32_t action) {
-  // Just return action directly if within range
-  return action < maxPageCopies ? action : 0;
+  // 2 bins as per the paper: actions less than or equal to half of max, or above
+  if (action <= maxPageCopies / 2) return 0;  // <= half of max
+  return 1;                                   // > half of max
 }
 
 uint32_t RLGarbageCollector::getTGCThreshold() const {
@@ -438,37 +537,49 @@ float RLGarbageCollector::calculateReward(uint64_t responseTime) {
   // If we don't have enough data to calculate thresholds, use a simple reward
   if (responseTimes.size() < 100) {
     // Simple reward: lower response time is better
-    reward = responseTime < 1000000 ? 1.0f : 0.0f;
+    // Use a more nuanced approach even with limited data
+    if (responseTime < 100000) {  // < 100μs
+      reward = 1.0f;              // Excellent response time
+    }
+    else if (responseTime < 1000000) {  // < 1ms
+      reward = 0.5f;                    // Good response time
+    }
+    else if (responseTime < 10000000) {  // < 10ms
+      reward = 0.0f;                     // Acceptable response time
+    }
+    else {
+      reward = -0.5f;                    // Poor response time
+    }
+    
     RL_DEBUG_LOG("[RL-GC REWARD] Simple reward calculation (not enough samples): " 
               << "responseTime=" << responseTime << "ns" 
-              << ", threshold=1000000ns"
               << ", reward=" << reward);
     return reward;
   }
   
   // Calculate reward based on percentile thresholds
   if (responseTime <= t1Threshold) {
-    // Response time is below 70th percentile - good
+    // Response time is below 70th percentile - excellent
     reward = 1.0f;
-    RL_DEBUG_LOG("[RL-GC REWARD] GOOD response time: " << responseTime 
+    RL_DEBUG_LOG("[RL-GC REWARD] EXCELLENT response time: " << responseTime 
               << "ns <= t1(" << t1Threshold << "ns), reward=" << reward);
   }
   else if (responseTime <= t2Threshold) {
-    // Response time is between 70th and 90th percentile - neutral
+    // Response time is between 70th and 90th percentile - good
     reward = 0.5f;
-    RL_DEBUG_LOG("[RL-GC REWARD] NEUTRAL response time: " << responseTime 
+    RL_DEBUG_LOG("[RL-GC REWARD] GOOD response time: " << responseTime 
               << "ns <= t2(" << t2Threshold << "ns), reward=" << reward);
   }
   else if (responseTime <= t3Threshold) {
-    // Response time is between 90th and 99th percentile - bad
+    // Response time is between 90th and 99th percentile - poor
     reward = -0.5f;
-    RL_DEBUG_LOG("[RL-GC REWARD] BAD response time: " << responseTime 
+    RL_DEBUG_LOG("[RL-GC REWARD] POOR response time: " << responseTime 
               << "ns <= t3(" << t3Threshold << "ns), reward=" << reward);
   }
   else {
-    // Response time is above 99th percentile - very bad
+    // Response time is above 99th percentile - very poor
     reward = -1.0f;
-    RL_DEBUG_LOG("[RL-GC REWARD] VERY BAD response time: " << responseTime 
+    RL_DEBUG_LOG("[RL-GC REWARD] VERY POOR response time: " << responseTime 
               << "ns > t3(" << t3Threshold << "ns), reward=" << reward);
   }
   
