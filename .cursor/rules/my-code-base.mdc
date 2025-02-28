@@ -1,6 +1,7 @@
 ---
 description: code correctness
 globs: 
+alwaysApply: true
 ---
 
 # Your rule content

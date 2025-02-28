@@ -1,0 +1,19 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+
+simplessd/cpu/
+simplessd/dram/
+simplessd/sim/
+simplessd/util/
+simplessd/lib/
+simplessd/pal/
+simplessd/icl/
+simplessd/hil/
+simplessd/CMakeLists.txt
+sim/
+sil/
+util/
+igl/
+bil/
+lib/
+CMakeFiles/
+cursor/
