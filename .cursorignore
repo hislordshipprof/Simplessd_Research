@@ -16,4 +16,11 @@ igl/
 bil/
 lib/
 CMakeFiles/
-cursor/
+.cursorignore
+.cursorrules
+.cursor
+.gitignore
+.git/
+.vscode/
+.clang-format
+.clang-tidy
