@@ -70,6 +70,10 @@ Makefile
 
 ## Visual Studio Code
 .vscode/
+.cursor/
+.cursorignore
+.gitmodules
+.cursorrules
 *.code-workspace
 .history/
 
