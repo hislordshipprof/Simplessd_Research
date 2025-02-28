@@ -17,9 +17,7 @@ bil/
 lib/
 CMakeFiles/
 .cursorignore
-.cursorrules
 .cursor
-.gitignore
 .git/
 .vscode/
 .clang-format
