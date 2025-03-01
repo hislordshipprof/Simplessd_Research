@@ -62,14 +62,16 @@ Config::Config() {
   evictPolicy = POLICY_GREEDY;
   dChoiceParam = 3;
   randomIOTweak = true;
+  
+  // Update RL-GC default parameters to match paper recommendations
   enableRLGC = false;
-  rlGCTgcThreshold = 10;
-  rlGCTigcThreshold = 3;
-  rlGCMaxPageCopies = 2;
-  rlGCLearningRate = 0.3f;
-  rlGCDiscountFactor = 0.8f;
-  rlGCInitEpsilon = 0.8f;
-  rlGCNumActions = 7;
+  rlGCTgcThreshold = 10;      // Regular GC threshold
+  rlGCTigcThreshold = 5;      // Intensive GC threshold
+  rlGCMaxPageCopies = 10;     // Maximum pages to copy per action
+  rlGCLearningRate = 0.3f;    // Alpha parameter
+  rlGCDiscountFactor = 0.8f;  // Gamma parameter
+  rlGCInitEpsilon = 0.8f;     // Initial exploration rate (80%)
+  rlGCNumActions = 10;        // Number of discrete actions
   rlGCDebugEnable = false;
 }
 

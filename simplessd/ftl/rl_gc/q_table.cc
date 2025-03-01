@@ -23,6 +23,7 @@
 #include <iostream>  // For debug printing
 #include <fstream>   // For file output
 #include <sstream>   // For string stream operations
+#include <iomanip>   // For std::setprecision
 
 namespace SimpleSSD {
 
@@ -81,6 +82,15 @@ QTable::QTable(float learningRate, float discountFactor, float initialEpsilon, u
   // Seed the random number generator
   unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
   rng.seed(seed);
+  
+  // Ensure epsilon starts at 0.8 (80%) if not explicitly set otherwise
+  // This matches the paper's recommendation for high initial exploration
+  if (epsilon <= 0.0f || epsilon > 1.0f) {
+    epsilon = 0.8f;
+    std::stringstream ss;
+    ss << "[RL-DEBUG] Invalid epsilon value provided, defaulting to 0.8 (80%)";
+    writeQTableDebug(ss.str());
+  }
   
   std::stringstream ss;
   ss << "[RL-DEBUG] QTable initialized with alpha=" << alpha 
@@ -219,12 +229,27 @@ float QTable::getQValue(const State &state, uint32_t action) {
 void QTable::decayEpsilon() {
   // Gradually reduce epsilon over time
   float oldEpsilon = epsilon;
-  if (epsilon > 0.01f) {
-    epsilon = std::max(0.01f, epsilon * 0.99f);
+  
+  // After 1000 GC operations, reduce epsilon to 0.01 (1%)
+  if (gcCount >= 1000 && epsilon > 0.01f) {
+    epsilon = 0.01f;
     
     std::stringstream ss;
-    ss << "[RL-DEBUG] Epsilon decayed: " << oldEpsilon << " -> " << epsilon;
+    ss << "[RL-DEBUG] Epsilon reduced to 1% after " << gcCount << " GC operations";
     writeQTableDebug(ss.str());
+  }
+  // Otherwise, apply a gradual decay that will reach ~0.1 by 1000 operations
+  else if (epsilon > 0.01f) {
+    // Use a slower decay rate to maintain higher exploration early on
+    epsilon = std::max(0.01f, epsilon * 0.998f);
+    
+    // Only log significant changes to avoid excessive logging
+    if (std::abs(oldEpsilon - epsilon) > 0.01f) {
+      std::stringstream ss;
+      ss << "[RL-DEBUG] Epsilon decayed: " << std::fixed << std::setprecision(4) 
+         << oldEpsilon << " -> " << epsilon;
+      writeQTableDebug(ss.str());
+    }
   }
 }
 
