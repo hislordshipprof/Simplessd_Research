@@ -27,9 +27,13 @@
 #include <functional>
 #include <limits>
 #include <random>
+#include <sys/stat.h>   // For directory operations
+#include <unistd.h>     // For access() function
+#include <cstdlib>      // For system() function
 
 #include "util/algorithm.hh"
 #include "util/bitset.hh"
+#include "util/simplessd.hh"   // For Logger
 
 namespace SimpleSSD {
 
@@ -87,17 +91,14 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
       std::string debugPath = "output/rl_gc_debug.log";
       
       // Create output directory if it doesn't exist
-      #ifdef _WIN32
-      // Windows
-      if (system("if not exist output mkdir output") != 0) {
-        std::cerr << "Warning: Failed to create output directory" << std::endl;
+      struct stat st;
+      if (::stat("output", &st) != 0) {
+        int ret = std::system("mkdir -p output");
+        if (ret != 0) {
+          std::cerr << "Error: Failed to create output directory" << std::endl;
+          exit(1);
+        }
       }
-      #else
-      // Linux/Unix/MacOS
-      if (system("mkdir -p output") != 0) {
-        std::cerr << "Warning: Failed to create output directory" << std::endl;
-      }
-      #endif
       
       // Clear existing log file
       std::ofstream logFile(debugPath, std::ios::trunc);
@@ -248,6 +249,8 @@ bool PageMapping::initialize() {
 }
 
 void PageMapping::read(Request &req, uint64_t &tick) {
+  // Log starting tick
+  debugprint(LOG_FTL_PAGE_MAPPING, "READ START: LPN %" PRIu64 ", tick=%" PRIu64, req.lpn, tick);
   lastIOStartTime = tick;
   
   // Call original read logic
@@ -255,17 +258,24 @@ void PageMapping::read(Request &req, uint64_t &tick) {
   
   if (req.ioFlag.count() > 0) {
     readInternal(req, tick);
-
-    debugprint(LOG_FTL_PAGE_MAPPING,
-               "READ  | LPN %" PRIu64 " | %" PRIu64 " - %" PRIu64 " (%" PRIu64
-               ")",
-               req.lpn, beginAt, tick, tick - beginAt);
+    
+    // Log tick after internal processing
+    debugprint(LOG_FTL_PAGE_MAPPING, 
+               "READ INTERNAL COMPLETE: LPN %" PRIu64 ", tick=%" PRIu64 ", delta=%" PRIu64,
+               req.lpn, tick, tick - beginAt);
   }
   else {
     warn("FTL got empty request");
   }
 
+  // Log tick before CPU latency
+  debugprint(LOG_FTL_PAGE_MAPPING, "Before CPU latency: tick=%" PRIu64, tick);
+  
+  // Apply CPU latency
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::READ);
+  
+  // Log tick after all processing
+  debugprint(LOG_FTL_PAGE_MAPPING, "READ COMPLETE: tick=%" PRIu64, tick);
   
   // Record IO completion time
   lastIOEndTime = tick;
@@ -292,6 +302,12 @@ void PageMapping::read(Request &req, uint64_t &tick) {
         performPartialGC(action, victimBlocks, tick);
       }
     }
+  }
+
+  // Add this where I/O requests are completed in regular GC mode
+  if (!bEnableRLGC) {
+    uint64_t responseTime = tick - lastIOStartTime;
+    logRegularGCResponseTime(responseTime);
   }
 }
 
@@ -1277,6 +1293,45 @@ uint32_t PageMapping::performPartialGC(uint32_t pagesToCopy, std::vector<uint32_
   
   // Return the number of copied pages
   return copiedPages;
+}
+
+// Add this new function to log regular GC response times
+void PageMapping::logRegularGCResponseTime(uint64_t responseTime) {
+  static bool headerWritten = false;
+  static uint64_t ioCount = 0;
+  
+  // Create output directory if it doesn't exist
+  struct stat st;
+  if (::stat("output", &st) != 0) {
+    int ret = std::system("mkdir -p output");
+    if (ret != 0) {
+      std::cerr << "Error: Failed to create output directory" << std::endl;
+      exit(1);
+    }
+  }
+  
+  // Define log file path
+  static std::string logPath = "output/regular_gc_response.csv";
+  
+  std::ofstream logFile;
+  
+  // If this is the first write, create the file with header
+  if (!headerWritten) {
+    logFile.open(logPath, std::ios::trunc);
+    if (logFile.is_open()) {
+      logFile << "IO_Count,Response_Time_ns" << std::endl;
+      headerWritten = true;
+      logFile.close();
+    }
+  }
+  
+  // Append the response time data
+  logFile.open(logPath, std::ios::app);
+  if (logFile.is_open()) {
+    logFile << ioCount << "," << responseTime << std::endl;
+    ioCount++;
+    logFile.close();
+  }
 }
 
 }  // namespace FTL

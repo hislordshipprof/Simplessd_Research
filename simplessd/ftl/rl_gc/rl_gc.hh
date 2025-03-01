@@ -29,6 +29,9 @@ namespace SimpleSSD {
 
 namespace FTL {
 
+// Forward declaration for DebugLogger
+class DebugLogger;
+
 /**
  * Reinforcement Learning-based Garbage Collection Controller
  */
@@ -79,6 +82,26 @@ class RLGarbageCollector {
   // Debug output
   bool debugEnabled;
   std::string debugFilePath;
+  DebugLogger *logger;  // Pointer to logger instance
+  
+  // Convergence monitoring
+  std::vector<float> rewardHistory;
+  std::vector<float> movingAverageRewards;
+  uint32_t convergenceCounter;
+  bool qTableConverged;
+  uint32_t responseCounter;            // Counter for tracking responses (for logging frequency)
+  
+  // Action reward history tracking
+  struct ActionRewardHistory {
+    std::vector<std::pair<uint64_t, float>> rewards; // (iteration, reward) pairs
+    float cumulativeReward;
+    uint64_t count;
+    
+    ActionRewardHistory() : cumulativeReward(0.0f), count(0) {}
+  };
+  std::vector<ActionRewardHistory> actionRewards; // Indexed by action
+  bool enableRewardLogging;
+  std::string rewardLogFilePath;
   
   // Helper functions
   uint32_t discretizePrevInterval(uint64_t interval);
@@ -126,6 +149,20 @@ class RLGarbageCollector {
   void setDebugFilePath(const std::string &path) { debugFilePath = path; }
   bool isDebugEnabled() const { return debugEnabled; }
   const std::string& getDebugFilePath() const { return debugFilePath; }
+
+  // Convergence monitoring
+  void trackRewardTrends();
+  bool isConverged() const { return qTableConverged; }
+  void exportConvergenceData(const std::string &filename);
+
+  // Methods for reward history visualization
+  void enableActionRewardLogging(const std::string& logFilePath);
+  void disableActionRewardLogging();
+  void logActionReward(uint32_t action, float reward);
+  void saveActionRewardHistory();
+  
+  // Method for response time logging
+  void logResponseTime(uint64_t responseTime);
 };
 
 }  // namespace FTL

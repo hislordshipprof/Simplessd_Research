@@ -85,6 +85,14 @@ class PageMapping : public AbstractFTL {
 
   uint32_t performPartialGC(uint32_t pagesToCopy, std::vector<uint32_t> &victimBlocks, uint64_t &tick);
 
+  // Regular GC methods
+  bool doGarbageCollection(std::vector<uint32_t> *eblocks = nullptr);
+  uint32_t collectGarbage(std::vector<uint32_t> *eblocks);
+  void performPartialGC(uint32_t numCopy, std::vector<uint32_t> *eblocks = nullptr);
+  
+  // Response time logging for regular GC
+  void logRegularGCResponseTime(uint64_t responseTime);
+
  public:
   PageMapping(ConfigReader &, Parameter &, PAL::PAL *, DRAM::AbstractDRAM *);
   ~PageMapping();

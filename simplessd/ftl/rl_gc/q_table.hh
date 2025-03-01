@@ -76,6 +76,13 @@ class QTable {
   // Random number generator
   std::mt19937 rng;
 
+  // Convergence tracking
+  std::unordered_map<State, std::vector<float>, State::StateHash> previousQValues;
+  std::unordered_map<State, uint32_t, State::StateHash> currentPolicy;
+  std::vector<float> qValueDeltas;
+  float convergenceThreshold;
+  bool hasConverged;
+
  public:
   QTable(float learningRate, float discountFactor, float initialEpsilon, uint32_t actionCount);
   ~QTable();
@@ -90,6 +97,16 @@ class QTable {
   float getEpsilon() const;
   void setEpsilon(float newEpsilon);
   uint64_t getGCCount() const;
+
+  // Convergence monitoring
+  float getMaxQValueDelta();
+  bool checkConvergence();
+  void exportQTableToCSV(const std::string &filename);
+  float getConvergenceMetric() const;
+  bool isConverged() const { return hasConverged; }
+  
+  // Get the number of unique states in the Q-table
+  uint32_t getNumStates() const;
 };
 
 }  // namespace FTL
