@@ -69,6 +69,8 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
   // Initialize based on GC policy
   activeGCPolicy = (GC_POLICY)conf.readUint(CONFIG_FTL, FTL_GC_POLICY);
   
+  debugprint(LOG_FTL_PAGE_MAPPING, "Selected GC Policy: %d", activeGCPolicy);
+
   // Setup output directory for all policies
   #ifdef _WIN32
   // Windows
@@ -83,9 +85,8 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
   #endif
   
   // Initialize RL-GC
-  bEnableRLGC = conf.readBoolean(CONFIG_FTL, FTL_RL_GC_ENABLE) || 
-                (activeGCPolicy == GC_POLICY_RL_BASELINE || 
-                 activeGCPolicy == GC_POLICY_RL_INTENSIVE || 
+  bEnableRLGC = (activeGCPolicy == GC_POLICY_RL_BASELINE ||
+                 activeGCPolicy == GC_POLICY_RL_INTENSIVE ||
                  activeGCPolicy == GC_POLICY_RL_AGGRESSIVE);
   
   if (bEnableRLGC) {
@@ -132,6 +133,13 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
       // Print initial debug info
       pRLGC->printDebugInfo();
     }
+    
+    // Ensure Lazy-RTGC pointer is null if RL-GC is active
+    if (pLazyRTGC) {
+        delete pLazyRTGC;
+        pLazyRTGC = nullptr;
+    }
+    bEnableLazyRTGC = false; 
   }
   else {
     pRLGC = nullptr;
@@ -152,6 +160,13 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
       pLazyRTGC->enableMetrics(true);
       pLazyRTGC->setMetricsFilePath("output/lazy_rtgc_");
     }
+    
+    // Ensure RL-GC pointer is null if Lazy-RTGC is active
+    if (pRLGC) {
+        delete pRLGC;
+        pRLGC = nullptr;
+    }
+    bEnableRLGC = false; 
   }
   else {
     pLazyRTGC = nullptr;
@@ -165,13 +180,16 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
 PageMapping::~PageMapping() {
   // Clean up RL-GC
   if (pRLGC) {
+    // If RL GC needs finalization in the future, add it here
     delete pRLGC;
   }
   
   // Clean up Lazy-RTGC
   if (pLazyRTGC) {
-    // Finalize metrics before destruction
-    if (bEnableLazyRTGC) {
+    // Finalize metrics before destruction if the object exists and was enabled
+    // Check bEnableLazyRTGC as well, although pLazyRTGC should only be non-null if enabled
+    if (bEnableLazyRTGC && pLazyRTGC->isMetricsEnabled()) { 
+      debugprint(LOG_FTL_PAGE_MAPPING, "Finalizing Lazy-RTGC metrics...");
       pLazyRTGC->finalizeMetrics();
     }
     delete pLazyRTGC;
@@ -391,17 +409,49 @@ void PageMapping::write(Request &req, uint64_t &tick) {
   switch (activeGCPolicy) {
     case GC_POLICY_LAZY_RTGC:
       if (bEnableLazyRTGC && pLazyRTGC) {
-        // Record metrics
+        // Record metrics first, including write latency
+        // This should happen regardless of GC triggering
         pLazyRTGC->updateWriteLatencyStats(responseTime);
         
-        // Lazy-RTGC only performs GC after write operations as per research paper
+        // Check if GC should be triggered based on Lazy-RTGC's threshold
         if (pLazyRTGC->shouldTriggerGC(nFreeBlocks)) {
-          uint32_t maxPageCopies = pLazyRTGC->getMaxPageCopies();
-          std::vector<uint32_t> victimBlocks;
-          uint32_t copiedPages = performPartialGC(maxPageCopies, victimBlocks, tick);
+          // Get the fixed number of pages to copy for this partial GC step
+          uint32_t pagesToCopy = pLazyRTGC->getMaxPageCopies();
           
-          // Record GC activity
-          pLazyRTGC->recordGCInvocation(copiedPages);
+          if (pagesToCopy > 0) {
+              debugprint(LOG_FTL_PAGE_MAPPING, 
+                         "LAZY-RTGC: Triggering partial GC for %u pages. Free blocks: %u", 
+                         pagesToCopy, nFreeBlocks);
+
+              // Select victim blocks using the standard FTL method
+              std::vector<uint32_t> victimBlocks;
+              uint64_t gcStartTime = tick; // Record time before victim selection
+              selectVictimBlock(victimBlocks, tick); // selectVictimBlock adds its own latency to tick
+
+              if (!victimBlocks.empty()) {
+                  // Perform the partial GC
+                  uint32_t actualCopiedPages = performPartialGC(pagesToCopy, victimBlocks, tick);
+                  
+                  // Record GC invocation with LazyRTGC object
+                  // Pass the number of pages actually copied
+                  pLazyRTGC->recordGCInvocation(actualCopiedPages);
+
+                  debugprint(LOG_FTL_PAGE_MAPPING,
+                             "LAZY-RTGC: Partial GC completed. Copied %u pages. Tick: %" PRIu64 " -> %" PRIu64,
+                             actualCopiedPages, gcStartTime, tick);
+
+              } else {
+                  warn("LAZY-RTGC: GC triggered but no victim block selected.");
+                  // Consider if LazyRTGC needs notification of failed GC trigger?
+                  // Currently, no explicit mechanism, but invocation won't be recorded.
+              }
+          } else {
+               debugprint(LOG_FTL_PAGE_MAPPING, "LAZY-RTGC: GC triggered but MaxPageCopies is 0. Skipping GC.");
+          }
+        } else {
+           // Optional: Debug log when GC is not triggered
+           debugprint(LOG_FTL_PAGE_MAPPING, "LAZY-RTGC: Free blocks %u > Threshold %u. No GC triggered.", 
+                       nFreeBlocks, pLazyRTGC->getGCThreshold());
         }
       }
       break;
@@ -499,12 +549,16 @@ void PageMapping::write(Request &req, uint64_t &tick) {
       
     default: // GC_POLICY_DEFAULT
       // Check if we need to do garbage collection using original policy
-      bool needGC = bReclaimMore || nFreeBlocks <= conf.readUint(CONFIG_FTL, FTL_RL_GC_TGC_THRESHOLD);
+      // ** Important: Use the generic FTL GC Threshold here, not the RL one **
+      float defaultGCThresholdRatio = conf.readFloat(CONFIG_FTL, FTL_GC_THRESHOLD_RATIO);
+      uint32_t defaultGCThresholdBlocks = static_cast<uint32_t>(param.totalPhysicalBlocks * defaultGCThresholdRatio);
+      bool needGC = bReclaimMore || (nFreeBlocks <= defaultGCThresholdBlocks);
       
       if (needGC) {
         // Use original GC implementation
+        debugprint(LOG_FTL_PAGE_MAPPING, "DEFAULT GC: Triggering full GC. Free blocks: %u", nFreeBlocks);
         std::vector<uint32_t> victimBlocks;
-        doGarbageCollection(victimBlocks, tick);
+        doGarbageCollection(victimBlocks, tick); // Calls selectVictimBlock internally if list is empty
       }
       break;
   }
@@ -1188,6 +1242,29 @@ void PageMapping::eraseInternal(PAL::Request &req, uint64_t &tick) {
   blocks.erase(block);
 
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::ERASE_INTERNAL);
+
+  // Update policy-specific erase counts
+  switch (activeGCPolicy) {
+      case GC_POLICY_LAZY_RTGC:
+          if (pLazyRTGC) {
+              // Debug print to confirm path and object validity
+              debugprint(LOG_FTL_PAGE_MAPPING, "LAZY-RTGC: Recording block erase. pLazyRTGC is valid.");
+              pLazyRTGC->recordBlockErase();
+          } else {
+              // Log a warning if the pointer is unexpectedly null
+              warn("LAZY-RTGC: Attempted to record block erase, but pLazyRTGC is null!");
+          }
+          break;
+      case GC_POLICY_RL_BASELINE:
+      case GC_POLICY_RL_INTENSIVE:
+      case GC_POLICY_RL_AGGRESSIVE:
+          // Assuming RL policies don't track erasures separately for now
+          // If needed, add pRLGC->recordBlockErase() or similar here
+          break;
+      default: // GC_POLICY_DEFAULT or others
+          // No specific tracking needed for default policy
+          break;
+  }
 }
 
 float PageMapping::calculateWearLeveling() {

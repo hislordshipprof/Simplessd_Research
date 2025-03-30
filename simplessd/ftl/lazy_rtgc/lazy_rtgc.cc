@@ -127,9 +127,9 @@ void LazyRTGC::updateReadLatencyStats(uint64_t responseTime) {
       (stats.responseTimeCount + 1);
   stats.responseTimeCount++;
   
-  // If metrics are enabled and we've collected enough samples, output metrics
+  // If metrics are enabled and we've collected enough samples, output metrics periodically
   if (metricsEnabled && (stats.responseTimeCount % 1000 == 0)) {
-    outputMetricsToFile();
+    outputMetricsToFile(); // Reinstate periodic output call
   }
 }
 
@@ -160,12 +160,6 @@ void LazyRTGC::updateWriteLatencyStats(uint64_t responseTime) {
 void LazyRTGC::recordGCInvocation(uint32_t copiedPages) {
   stats.gcInvocations++;
   stats.totalPageCopies += copiedPages;
-  stats.validPageCopies += copiedPages; // Assuming all copied pages are valid for now
-  
-  // If metrics are enabled, output after GC
-  if (metricsEnabled) {
-    outputMetricsToFile();
-  }
 }
 
 // Record block erase
@@ -245,11 +239,11 @@ void LazyRTGC::outputMetricsToFile() {
       p9999 = getLatencyPercentile(99.99f);
     }
     
-    // Write metrics line
+    // Write metrics line - output 0 for valid_copies
     metricsFile << currentRequestTime << " "
                 << stats.gcInvocations << " "
                 << stats.totalPageCopies << " "
-                << stats.validPageCopies << " "
+                << 0 << " " // Placeholder for valid_copies
                 << stats.eraseCount << " "
                 << std::fixed << std::setprecision(2) << stats.avgResponseTime << " "
                 << p99 << " "
@@ -302,7 +296,8 @@ void LazyRTGC::finalizeMetrics() {
     summaryFile << "-------------" << std::endl;
     summaryFile << "Total GC Invocations: " << stats.gcInvocations << std::endl;
     summaryFile << "Total Pages Copied: " << stats.totalPageCopies << std::endl;
-    summaryFile << "Valid Pages Copied: " << stats.validPageCopies << std::endl;
+    summaryFile << "Valid Pages Copied: " << stats.validPageCopies 
+                << " (Note: May not be accurately tracked by LazyRTGC)" << std::endl; 
     summaryFile << "Block Erasures: " << stats.eraseCount << std::endl;
     summaryFile << std::endl;
     
@@ -320,15 +315,14 @@ void LazyRTGC::finalizeMetrics() {
     summaryFile << "------------------" << std::endl;
     float avgPagesPerGC = stats.gcInvocations > 0 ? (float)stats.totalPageCopies / stats.gcInvocations : 0;
     summaryFile << "Average Pages Copied per GC: " << std::fixed << std::setprecision(2) << avgPagesPerGC << std::endl;
-    float validPageRatio = stats.totalPageCopies > 0 ? (float)stats.validPageCopies / stats.totalPageCopies * 100 : 0;
-    summaryFile << "Valid Page Copy Ratio: " << std::fixed << std::setprecision(2) << validPageRatio << "%" << std::endl;
+    summaryFile << "Valid Page Copy Ratio: N/A (See Valid Pages Copied note)" << std::endl; 
     
     summaryFile.close();
     
     std::cout << "Lazy-RTGC summary metrics saved to: " << summaryPath << std::endl;
   }
   else {
-    std::cerr << "Warning: Failed to open Lazy-RTGC metrics file for writing" << std::endl;
+    std::cerr << "Warning: Failed to open Lazy-RTGC summary file for writing" << std::endl;
   }
 }
 
@@ -341,7 +335,7 @@ void LazyRTGC::setMetricsFilePath(const std::string &basePath) {
     std::ofstream metricsFile(metricsFilePath, std::ios::trunc);
     if (metricsFile.is_open()) {
       metricsFile << "# Lazy-RTGC Metrics" << std::endl;
-      metricsFile << "# Format: <timestamp> <gc_invocations> <page_copies> <valid_copies> <erases> <avg_response_time> <p99_latency> <p99.9_latency> <p99.99_latency>" << std::endl;
+      metricsFile << "# Format: <timestamp> <gc_invocations> <page_copies> <valid_copies(placeholder)> <erases> <avg_response_time> <p99_latency> <p99.9_latency> <p99.99_latency>" << std::endl;
       metricsFile.close();
     }
   }
