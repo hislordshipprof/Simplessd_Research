@@ -95,6 +95,7 @@ class RLGarbageCollector {
   // Core methods
   bool shouldTriggerGC(uint32_t freeBlocks, uint64_t currentTime);
   uint32_t getGCAction(uint32_t freeBlocks);
+  uint32_t getMaxGCAction(); // Return maximum action for aggressive policy
   void updateState(uint64_t currentTime);
   void recordResponseTime(uint64_t responseTime);
   float updateQValue(uint64_t responseTime);

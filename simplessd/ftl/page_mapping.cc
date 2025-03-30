@@ -66,8 +66,27 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
   bRandomTweak = conf.readBoolean(CONFIG_FTL, FTL_USE_RANDOM_IO_TWEAK);
   bitsetSize = bRandomTweak ? param.ioUnitInPage : 1;
 
+  // Initialize based on GC policy
+  activeGCPolicy = (GC_POLICY)conf.readUint(CONFIG_FTL, FTL_GC_POLICY);
+  
+  // Setup output directory for all policies
+  #ifdef _WIN32
+  // Windows
+  if (system("if not exist output mkdir output") != 0) {
+    std::cerr << "Warning: Failed to create output directory" << std::endl;
+  }
+  #else
+  // Linux/Unix/MacOS
+  if (system("mkdir -p output") != 0) {
+    std::cerr << "Warning: Failed to create output directory" << std::endl;
+  }
+  #endif
+  
   // Initialize RL-GC
-  bEnableRLGC = conf.readBoolean(CONFIG_FTL, FTL_RL_GC_ENABLE);
+  bEnableRLGC = conf.readBoolean(CONFIG_FTL, FTL_RL_GC_ENABLE) || 
+                (activeGCPolicy == GC_POLICY_RL_BASELINE || 
+                 activeGCPolicy == GC_POLICY_RL_INTENSIVE || 
+                 activeGCPolicy == GC_POLICY_RL_AGGRESSIVE);
   
   if (bEnableRLGC) {
     uint32_t tgcThreshold = conf.readUint(CONFIG_FTL, FTL_RL_GC_TGC_THRESHOLD);
@@ -84,20 +103,21 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
     // Enable debug output for RL-GC
     bool enableDebug = conf.readBoolean(CONFIG_FTL, FTL_RL_GC_DEBUG_ENABLE);
     if (enableDebug) {
-      std::string debugPath = "output/rl_gc_debug.log";
+      std::string debugPath;
       
-      // Create output directory if it doesn't exist
-      #ifdef _WIN32
-      // Windows
-      if (system("if not exist output mkdir output") != 0) {
-        std::cerr << "Warning: Failed to create output directory" << std::endl;
+      // Set appropriate debug file path based on active policy
+      if (activeGCPolicy == GC_POLICY_RL_BASELINE) {
+        debugPath = "output/rl_baseline_debug.log";
       }
-      #else
-      // Linux/Unix/MacOS
-      if (system("mkdir -p output") != 0) {
-        std::cerr << "Warning: Failed to create output directory" << std::endl;
+      else if (activeGCPolicy == GC_POLICY_RL_INTENSIVE) {
+        debugPath = "output/rl_intensive_gc_debug.log";
       }
-      #endif
+      else if (activeGCPolicy == GC_POLICY_RL_AGGRESSIVE) {
+        debugPath = "output/rl_aggressive_debug.log";
+      }
+      else {
+        debugPath = "output/rl_gc_debug.log";
+      }
       
       // Clear existing log file
       std::ofstream logFile(debugPath, std::ios::trunc);
@@ -117,14 +137,44 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
     pRLGC = nullptr;
   }
   
+  // Initialize Lazy-RTGC
+  bEnableLazyRTGC = (activeGCPolicy == GC_POLICY_LAZY_RTGC);
+  
+  if (bEnableLazyRTGC) {
+    uint32_t gcThreshold = conf.readUint(CONFIG_FTL, FTL_LAZY_RTGC_THRESHOLD); // Use dedicated Lazy-RTGC threshold
+    uint32_t maxPageCopies = conf.readUint(CONFIG_FTL, FTL_LAZY_RTGC_MAX_PAGE_COPIES);
+    
+    pLazyRTGC = new LazyRTGC(gcThreshold, maxPageCopies);
+    
+    // Enable metrics output
+    bool enableMetrics = conf.readBoolean(CONFIG_FTL, FTL_LAZY_RTGC_METRICS_ENABLE);
+    if (enableMetrics) {
+      pLazyRTGC->enableMetrics(true);
+      pLazyRTGC->setMetricsFilePath("output/lazy_rtgc_");
+    }
+  }
+  else {
+    pLazyRTGC = nullptr;
+  }
+  
   lastIOStartTime = 0;
   lastIOEndTime = 0;
+  lastOpIsWrite = false;
 }
 
 PageMapping::~PageMapping() {
   // Clean up RL-GC
   if (pRLGC) {
     delete pRLGC;
+  }
+  
+  // Clean up Lazy-RTGC
+  if (pLazyRTGC) {
+    // Finalize metrics before destruction
+    if (bEnableLazyRTGC) {
+      pLazyRTGC->finalizeMetrics();
+    }
+    delete pLazyRTGC;
   }
 }
 
@@ -246,9 +296,9 @@ bool PageMapping::initialize() {
 
   return true;
 }
-
 void PageMapping::read(Request &req, uint64_t &tick) {
   lastIOStartTime = tick;
+  lastOpIsWrite = false; // Mark as read operation
   
   // Call original read logic
   uint64_t beginAt = tick;
@@ -269,34 +319,55 @@ void PageMapping::read(Request &req, uint64_t &tick) {
   
   // Record IO completion time
   lastIOEndTime = tick;
+  uint64_t responseTime = lastIOEndTime - lastIOStartTime;
   
-  // If RL-GC is enabled, record response time for reward calculation
-  if (bEnableRLGC && pRLGC) {
-    uint64_t responseTime = lastIOEndTime - lastIOStartTime;
-    pRLGC->recordResponseTime(responseTime);
-    
-    // Process any pending Q-value updates
-    if (pRLGC->hasPendingQValueUpdate()) {
-      pRLGC->processPendingUpdate(responseTime);
-    }
-    
-    // Only check for GC if we have a valid RL-GC controller and free blocks are below threshold
-    if (nFreeBlocks <= pRLGC->getTGCThreshold()) {
-      // Check if we should trigger GC based on inter-request interval
-      if (pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
-        // Get the action to take
-        uint32_t action = pRLGC->getGCAction(nFreeBlocks);
-        
-        // Perform partial GC based on the action
-        std::vector<uint32_t> victimBlocks;
-        performPartialGC(action, victimBlocks, tick);
+  // Handle policy-specific logic for read operations
+  switch (activeGCPolicy) {
+    case GC_POLICY_LAZY_RTGC:
+      if (bEnableLazyRTGC && pLazyRTGC) {
+        // Lazy-RTGC only records metrics for read operations, no GC triggered on reads
+        pLazyRTGC->updateReadLatencyStats(responseTime);
       }
-    }
+      break;
+      
+    case GC_POLICY_RL_BASELINE:
+    case GC_POLICY_RL_INTENSIVE:
+    case GC_POLICY_RL_AGGRESSIVE:
+      if (bEnableRLGC && pRLGC) {
+        // Record metrics for RL policies
+        pRLGC->recordResponseTime(responseTime);
+        
+        // Process any pending Q-value updates
+        if (pRLGC->hasPendingQValueUpdate()) {
+          pRLGC->processPendingUpdate(responseTime);
+        }
+        
+        // Only check for GC if we have a valid RL-GC controller and free blocks are below threshold
+        if (nFreeBlocks <= pRLGC->getTGCThreshold()) {
+          // Check if we should trigger GC based on inter-request interval
+          if (pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
+            // Get the action to take
+            uint32_t action = pRLGC->getGCAction(nFreeBlocks);
+            
+            // Perform partial GC based on the action
+            std::vector<uint32_t> victimBlocks;
+            uint32_t copiedPages = performPartialGC(action, victimBlocks, tick);
+            
+            // Record GC invocation
+            pRLGC->recordGCInvocation(copiedPages);
+          }
+        }
+      }
+      break;
+      
+    default: // GC_POLICY_DEFAULT
+      // No specific handling for default policy on reads
+      break;
   }
 }
-
 void PageMapping::write(Request &req, uint64_t &tick) {
   lastIOStartTime = tick;
+  lastOpIsWrite = true; // Mark as write operation
   
   if (req.ioFlag.count() > 0) {
     writeInternal(req, tick);
@@ -314,49 +385,128 @@ void PageMapping::write(Request &req, uint64_t &tick) {
   
   // Record IO completion time
   lastIOEndTime = tick;
+  uint64_t responseTime = lastIOEndTime - lastIOStartTime;
   
-  // If RL-GC is enabled, record response time for reward calculation
-  if (bEnableRLGC && pRLGC) {
-    uint64_t responseTime = lastIOEndTime - lastIOStartTime;
-    pRLGC->recordResponseTime(responseTime);
-    
-    // Process any pending Q-value updates
-    if (pRLGC->hasPendingQValueUpdate()) {
-      pRLGC->processPendingUpdate(responseTime);
-    }
-  }
-  
-  // Check if we need to do garbage collection
-  bool needGC = bReclaimMore || nFreeBlocks <= conf.readUint(CONFIG_FTL, FTL_RL_GC_TGC_THRESHOLD);
-  
-  if (needGC) {
-    if (bEnableRLGC && pRLGC) {
-      // Check if we should trigger GC based on inter-request interval
-      if (pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
-        // Get the action to take
-        uint32_t action = pRLGC->getGCAction(nFreeBlocks);
+  // Handle policy-specific logic for write operations
+  switch (activeGCPolicy) {
+    case GC_POLICY_LAZY_RTGC:
+      if (bEnableLazyRTGC && pLazyRTGC) {
+        // Record metrics
+        pLazyRTGC->updateWriteLatencyStats(responseTime);
         
-        // Perform partial GC based on the action
-        std::vector<uint32_t> victimBlocks;
-        uint32_t copiedPages = performPartialGC(action, victimBlocks, tick);
-        
-        // Record GC invocation
-        pRLGC->recordGCInvocation(copiedPages);
+        // Lazy-RTGC only performs GC after write operations as per research paper
+        if (pLazyRTGC->shouldTriggerGC(nFreeBlocks)) {
+          uint32_t maxPageCopies = pLazyRTGC->getMaxPageCopies();
+          std::vector<uint32_t> victimBlocks;
+          uint32_t copiedPages = performPartialGC(maxPageCopies, victimBlocks, tick);
+          
+          // Record GC activity
+          pLazyRTGC->recordGCInvocation(copiedPages);
+        }
       }
-      else if (nFreeBlocks <= pRLGC->getTIGCThreshold()) {
-        // Critical situation - perform intensive GC
+      break;
+      
+    case GC_POLICY_RL_BASELINE:
+      if (bEnableRLGC && pRLGC) {
+        // Record metrics for RL baseline policy
+        pRLGC->recordResponseTime(responseTime);
+        
+        // Process any pending Q-value updates
+        if (pRLGC->hasPendingQValueUpdate()) {
+          pRLGC->processPendingUpdate(responseTime);
+        }
+        
+        // Check if we need to do garbage collection
+        bool needGC = bReclaimMore || nFreeBlocks <= pRLGC->getTGCThreshold();
+        
+        if (needGC && pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
+          // Get the action to take
+          uint32_t action = pRLGC->getGCAction(nFreeBlocks);
+          
+          // Perform partial GC based on the action
+          std::vector<uint32_t> victimBlocks;
+          uint32_t copiedPages = performPartialGC(action, victimBlocks, tick);
+          
+          // Record GC invocation
+          pRLGC->recordGCInvocation(copiedPages);
+        }
+      }
+      break;
+      
+    case GC_POLICY_RL_INTENSIVE:
+      if (bEnableRLGC && pRLGC) {
+        // Record metrics for RL intensive policy
+        pRLGC->recordResponseTime(responseTime);
+        
+        // Process any pending Q-value updates
+        if (pRLGC->hasPendingQValueUpdate()) {
+          pRLGC->processPendingUpdate(responseTime);
+        }
+        
+        // Check if we need to do garbage collection
+        bool needGC = bReclaimMore || nFreeBlocks <= pRLGC->getTGCThreshold();
+        
+        if (needGC) {
+          if (pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
+            // Get the action to take
+            uint32_t action = pRLGC->getGCAction(nFreeBlocks);
+            
+            // Perform partial GC based on the action
+            std::vector<uint32_t> victimBlocks;
+            uint32_t copiedPages = performPartialGC(action, victimBlocks, tick);
+            
+            // Record GC invocation
+            pRLGC->recordGCInvocation(copiedPages);
+          }
+          else if (nFreeBlocks <= pRLGC->getTIGCThreshold()) {
+            // Critical situation - perform intensive GC
+            std::vector<uint32_t> victimBlocks;
+            doGarbageCollection(victimBlocks, tick);
+            
+            // Record intensive GC
+            pRLGC->recordIntensiveGC();
+          }
+        }
+      }
+      break;
+      
+    case GC_POLICY_RL_AGGRESSIVE:
+      if (bEnableRLGC && pRLGC) {
+        // Record metrics for RL aggressive policy
+        pRLGC->recordResponseTime(responseTime);
+        
+        // Process any pending Q-value updates
+        if (pRLGC->hasPendingQValueUpdate()) {
+          pRLGC->processPendingUpdate(responseTime);
+        }
+        
+        // Aggressive policy triggers GC more frequently
+        bool needGC = bReclaimMore || nFreeBlocks <= (pRLGC->getTGCThreshold() * 2);
+        
+        if (needGC && pRLGC->shouldTriggerGC(nFreeBlocks, tick)) {
+          // Get the action to take - for aggressive policy, always take maximum action
+          uint32_t action = pRLGC->getMaxGCAction();
+          
+          // Perform partial GC based on the action
+          std::vector<uint32_t> victimBlocks;
+          uint32_t copiedPages = performPartialGC(action, victimBlocks, tick);
+          
+          // Record GC invocation
+          pRLGC->recordGCInvocation(copiedPages);
+        }
+      }
+      break;
+      
+    default: // GC_POLICY_DEFAULT
+      // Check if we need to do garbage collection using original policy
+      bool needGC = bReclaimMore || nFreeBlocks <= conf.readUint(CONFIG_FTL, FTL_RL_GC_TGC_THRESHOLD);
+      
+      if (needGC) {
+        // Use original GC implementation
         std::vector<uint32_t> victimBlocks;
         doGarbageCollection(victimBlocks, tick);
-        
-        // Record intensive GC
-        pRLGC->recordIntensiveGC();
       }
-    }
-    else {
-      // Use original GC implementation
-      std::vector<uint32_t> victimBlocks;
-      doGarbageCollection(victimBlocks, tick);
-    }
+      break;
   }
 }
 
@@ -1111,7 +1261,7 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   list.push_back(temp);
 
   // Add RL-GC stats if enabled
-  if (bEnableRLGC) {
+  if (bEnableRLGC && activeGCPolicy != GC_POLICY_LAZY_RTGC) {
     temp.name = prefix + "ftl.rlgc.gc_invocations";
     temp.desc = "Number of RL-GC invocations";
     list.push_back(temp);
@@ -1128,6 +1278,29 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
     temp.desc = "Average reward received by RL-GC";
     list.push_back(temp);
   }
+  
+  // Add Lazy-RTGC stats if enabled
+  if (bEnableLazyRTGC && activeGCPolicy == GC_POLICY_LAZY_RTGC) {
+    temp.name = prefix + "ftl.lazy_rtgc.gc_invocations";
+    temp.desc = "Number of Lazy-RTGC invocations";
+    list.push_back(temp);
+    
+    temp.name = prefix + "ftl.lazy_rtgc.page_copies";
+    temp.desc = "Total pages copied during Lazy-RTGC";
+    list.push_back(temp);
+    
+    temp.name = prefix + "ftl.lazy_rtgc.valid_copies";
+    temp.desc = "Valid pages copied during Lazy-RTGC";
+    list.push_back(temp);
+    
+    temp.name = prefix + "ftl.lazy_rtgc.block_erases";
+    temp.desc = "Number of blocks erased during Lazy-RTGC";
+    list.push_back(temp);
+    
+    temp.name = prefix + "ftl.lazy_rtgc.avg_response";
+    temp.desc = "Average response time with Lazy-RTGC";
+    list.push_back(temp);
+  }
 }
 
 void PageMapping::getStatValues(std::vector<double> &values) {
@@ -1138,7 +1311,7 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   values.push_back(calculateWearLeveling());
 
   // Add RL-GC stat values if enabled
-  if (bEnableRLGC) {
+  if (bEnableRLGC && activeGCPolicy != GC_POLICY_LAZY_RTGC) {
     uint64_t invocations, pageCopies, intensiveGCs;
     float avgReward;
     
@@ -1148,6 +1321,22 @@ void PageMapping::getStatValues(std::vector<double> &values) {
     values.push_back(pageCopies);
     values.push_back(intensiveGCs);
     values.push_back(avgReward);
+  }
+  
+  // Add Lazy-RTGC values if enabled
+  if (bEnableLazyRTGC && pLazyRTGC && activeGCPolicy == GC_POLICY_LAZY_RTGC) {
+    uint64_t invocations, pageCopies, validCopies, erases;
+    float avgResponse;
+    
+    // Get stats from Lazy-RTGC
+    pLazyRTGC->getStats(invocations, pageCopies, validCopies, erases, avgResponse);
+    
+    // Add them to values
+    values.push_back(invocations);
+    values.push_back(pageCopies);
+    values.push_back(validCopies);
+    values.push_back(erases);
+    values.push_back(avgResponse);
   }
 }
 
@@ -1270,6 +1459,25 @@ uint32_t PageMapping::performPartialGC(uint32_t pagesToCopy, std::vector<uint32_
     PAL::Request req(param.ioUnitInPage);
     req.blockIndex = victimBlockID;
     eraseInternal(req, tick);
+    
+    // Record block erase with the appropriate GC policy
+    GC_POLICY currentPolicy = (GC_POLICY)conf.readUint(CONFIG_FTL, FTL_GC_POLICY);
+    switch (currentPolicy) {
+      case GC_POLICY_LAZY_RTGC:
+        if (pLazyRTGC) {
+          pLazyRTGC->recordBlockErase();
+        }
+        break;
+      case GC_POLICY_RL_BASELINE:
+      case GC_POLICY_RL_INTENSIVE:
+      case GC_POLICY_RL_AGGRESSIVE:
+        // Other policies might need to record block erases in the future
+        // Currently the RL-based policies don't have a specific block erase counter
+        break;
+      default:
+        // Default GC policy doesn't need special tracking
+        break;
+    }
   }
   
   // Update statistics
@@ -1280,5 +1488,4 @@ uint32_t PageMapping::performPartialGC(uint32_t pagesToCopy, std::vector<uint32_
 }
 
 }  // namespace FTL
-
 }  // namespace SimpleSSD

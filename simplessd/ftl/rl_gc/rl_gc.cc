@@ -202,6 +202,27 @@ uint32_t RLGarbageCollector::getGCAction(uint32_t freeBlocks) {
   return action;
 }
 
+uint32_t RLGarbageCollector::getMaxGCAction() {
+  // For aggressive policy, always return the maximum action value
+  // This follows our research paper approach for the RL aggressive policy
+  // which maximizes free blocks by always performing maximum page copies
+  
+  RL_DEBUG_LOG("[RL-GC ACTION] Aggressive policy using maximum action " 
+            << maxPageCopies);
+  
+  // Update statistics
+  stats.gcInvocations++;
+  stats.totalPageCopies += maxPageCopies;
+  
+  // Store last action for next state
+  lastAction = maxPageCopies;
+  
+  // Schedule pending update with current state and action
+  schedulePendingUpdate(currentState, lastAction);
+  
+  return maxPageCopies;
+}
+
 void RLGarbageCollector::updateState(uint64_t currentTime) {
   // Store previous state for Q-learning
   previousState = currentState;

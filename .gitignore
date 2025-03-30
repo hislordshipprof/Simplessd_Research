@@ -110,7 +110,7 @@ $RECYCLE.BIN/
 .nfs*
 
 # SimpleSSD specific files
-/output/
+#/output/
 *.log
 *.txt
 *.csv

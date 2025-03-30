@@ -29,6 +29,7 @@
 #include "ftl/ftl.hh"
 #include "pal/pal.hh"
 #include "ftl/rl_gc/rl_gc.hh"
+#include "ftl/lazy_rtgc/lazy_rtgc.hh"
 
 namespace SimpleSSD {
 
@@ -63,8 +64,16 @@ class PageMapping : public AbstractFTL {
   RLGarbageCollector *pRLGC;
   bool bEnableRLGC;
   
+  // Lazy-RTGC implementation
+  LazyRTGC *pLazyRTGC;
+  bool bEnableLazyRTGC;
+  
+  // Current active GC policy
+  GC_POLICY activeGCPolicy;
+  
   uint64_t lastIOStartTime;
   uint64_t lastIOEndTime;
+  bool lastOpIsWrite;  // Track if last operation was a write
 
   float freeBlockRatio();
   uint32_t convertBlockIdx(uint32_t);
