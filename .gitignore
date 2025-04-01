@@ -130,3 +130,4 @@ vgcore.*
 *.tmp
 *.bak
 traces/
+output/
