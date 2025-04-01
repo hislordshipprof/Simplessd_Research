@@ -131,3 +131,8 @@ vgcore.*
 *.bak
 traces/
 output/
+results/
+RL_extracted_clean.md
+Lazy_RTGC.md
+README_analysis.md
+.cursor
