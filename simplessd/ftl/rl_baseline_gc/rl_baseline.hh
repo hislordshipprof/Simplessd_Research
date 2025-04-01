@@ -23,7 +23,7 @@
 #include <vector>
 #include <deque>
 #include <cstdint>
-#include "ftl/rl_gc/q_table.hh"
+#include "ftl/rl_baseline_gc/q_table.hh"
 
 namespace SimpleSSD {
 
@@ -67,18 +67,33 @@ class RLGarbageCollector {
   State pendingState;        // State for which the update is pending
   uint32_t pendingAction;    // Action for which the update is pending
   
+  // Intensive GC mode tracking
+ protected:
+  bool inIntensiveMode;          // Flag indicating if we're in intensive GC mode
+ private:
+  uint32_t intensiveGCMaxPageCopies; // Number of pages to copy during intensive GC
+
   // Stats
-  struct {
-    uint64_t gcInvocations;       // Number of GC invocations
-    uint64_t totalPageCopies;     // Total pages copied during GC
-    uint64_t intensiveGCCount;    // Number of intensive GCs triggered
-    float avgReward;              // Average reward
-    uint64_t rewardCount;         // Number of rewards received
+  struct Stats {
+    uint64_t gcInvocations;
+    uint64_t totalPageCopies;
+    uint64_t intensiveGCCount;
+    uint64_t readTriggeredGCCount;
+    uint64_t earlyGCCount;
+    uint64_t eraseCount;
+    float avgReward;
+    uint64_t rewardCount;
+    uint64_t responseTimeCount;
+    double avgResponseTime;  // Running average response time using EMA
   } stats;
   
   // Debug output
   bool debugEnabled;
   std::string debugFilePath;
+  
+  // Metrics output
+  bool metricsEnabled;
+  std::string metricsFilePath;
   
   // Helper functions
   uint32_t discretizePrevInterval(uint64_t interval);
@@ -86,6 +101,7 @@ class RLGarbageCollector {
   uint32_t discretizeAction(uint32_t action);
   void updatePercentileThresholds();
   float calculateReward(uint64_t responseTime);
+  uint64_t getLatencyPercentile(float percentile) const;
   
  public:
   RLGarbageCollector(uint32_t tgc, uint32_t tigc, uint32_t maxCopies,
@@ -100,8 +116,12 @@ class RLGarbageCollector {
   void recordResponseTime(uint64_t responseTime);
   float updateQValue(uint64_t responseTime);
   bool shouldPerformIntensiveGC(uint32_t freeBlocks);
+  bool shouldExitIntensiveMode(uint32_t freeBlocks);
+  void setIntensiveMode(bool enable);
+  bool isInIntensiveMode() const;
   void recordGCInvocation(uint32_t copiedPages);
   void recordIntensiveGC();  // New method to track intensive GC operations
+  void recordBlockErase();   // New method to track block erasures
   
   // Getters
   uint32_t getTGCThreshold() const;
@@ -116,7 +136,7 @@ class RLGarbageCollector {
   
   // Statistics
   void getStats(uint64_t &invocations, uint64_t &pageCopies,
-               uint64_t &intensiveGCs, float &avgReward);
+               uint64_t &intensiveGCs, float &avgReward, uint64_t &erases);
   void resetStats();
 
   // Debug helper
@@ -127,6 +147,13 @@ class RLGarbageCollector {
   void setDebugFilePath(const std::string &path) { debugFilePath = path; }
   bool isDebugEnabled() const { return debugEnabled; }
   const std::string& getDebugFilePath() const { return debugFilePath; }
+  
+  // Metrics control
+  void enableMetrics(bool enable) { metricsEnabled = enable; }
+  bool isMetricsEnabled() const { return metricsEnabled; }
+  void setMetricsFilePath(const std::string &basePath);
+  void outputMetricsToFile();
+  void finalizeMetrics();
 };
 
 }  // namespace FTL

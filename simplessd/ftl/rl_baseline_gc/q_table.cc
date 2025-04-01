@@ -17,7 +17,7 @@
  * along with SimpleSSD.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "ftl/rl_gc/q_table.hh"
+#include "ftl/rl_baseline_gc/q_table.hh"
 #include <algorithm>
 #include <chrono>
 #include <iostream>  // For debug printing
@@ -32,7 +32,7 @@ namespace FTL {
 // Helper function to write debug messages
 void writeQTableDebug(const std::string &message) {
   std::ofstream debugFile;
-  debugFile.open("output/rl_gc_debug.log", std::ios_base::app);
+  debugFile.open("output/rl_baseline_debug.log", std::ios_base::app);
   if (debugFile.is_open()) {
     debugFile << message << std::endl;
     debugFile.close();

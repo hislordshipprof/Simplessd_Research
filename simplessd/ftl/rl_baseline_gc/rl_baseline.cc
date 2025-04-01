@@ -17,13 +17,14 @@
  * along with SimpleSSD.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "ftl/rl_gc/rl_gc.hh"
+#include "ftl/rl_baseline_gc/rl_baseline.hh"
 #include <algorithm>
 #include <numeric>
 #include <iostream>
 #include <iomanip>  // For formatting output
 #include <fstream>  // For file output
 #include <sstream>  // For string stream operations
+#include <sys/stat.h>  // For directory creation
 
 namespace SimpleSSD {
 
@@ -60,8 +61,12 @@ RLGarbageCollector::RLGarbageCollector(uint32_t tgc, uint32_t tigc, uint32_t max
       hasPendingUpdate(false),
       pendingState(0, 0, 0),
       pendingAction(0),
+      inIntensiveMode(false),
+      intensiveGCMaxPageCopies(7),  // Based on paper: typically 5-7 page copies in intensive mode
       debugEnabled(false),
-      debugFilePath("output/rl_gc_debug.log") {
+      debugFilePath("output/rl_baseline_debug.log"),
+      metricsEnabled(false),
+      metricsFilePath("output/rl_baseline_metrics.txt") {
   
   // Initialize statistics
   stats.gcInvocations = 0;
@@ -69,15 +74,42 @@ RLGarbageCollector::RLGarbageCollector(uint32_t tgc, uint32_t tigc, uint32_t max
   stats.intensiveGCCount = 0;
   stats.avgReward = 0.0f;
   stats.rewardCount = 0;
+  stats.eraseCount = 0;
   
   // Initialize current state
   currentState = State(0, 0, 0);
+  
+  // Create output directory if metrics or debug are enabled
+  #ifdef _WIN32
+  // Windows
+  if (system("if not exist output mkdir output") != 0) {
+    std::cerr << "Warning: Failed to create output directory for RL-GC" << std::endl;
+  }
+  #else
+  // Linux/Unix/MacOS
+  if (system("mkdir -p output") != 0) {
+    std::cerr << "Warning: Failed to create output directory for RL-GC" << std::endl;
+  }
+  #endif
   
   // Create/clear the debug file if debug is enabled
   if (debugEnabled) {
     std::ofstream debugFile(debugFilePath, std::ios::trunc);
     if (debugFile.is_open()) {
       debugFile.close();
+    }
+  }
+  
+  // Initialize metrics file if metrics are enabled
+  if (metricsEnabled) {
+    std::ofstream metricsFile(metricsFilePath, std::ios::trunc);
+    if (metricsFile.is_open()) {
+      metricsFile << "# RL-Baseline Metrics" << std::endl;
+      metricsFile << "# Format: <timestamp> <gc_invocations> <page_copies> <intensive_gc_count> <erases> <avg_reward> <avg_response_time> <p99_latency> <p99.9_latency> <p99.99_latency>" << std::endl;
+      metricsFile.close();
+    }
+    else {
+      std::cerr << "Warning: Failed to initialize RL-Baseline metrics file" << std::endl;
     }
   }
   
@@ -92,6 +124,11 @@ RLGarbageCollector::RLGarbageCollector(uint32_t tgc, uint32_t tigc, uint32_t max
 }
 
 RLGarbageCollector::~RLGarbageCollector() {
+  // Finalize metrics if enabled
+  if (metricsEnabled) {
+    finalizeMetrics();
+  }
+  
   RL_DEBUG_LOG("[RL-GC SUMMARY] Final statistics:" << std::endl
             << "  GC invocations: " << stats.gcInvocations << std::endl
             << "  Total page copies: " << stats.totalPageCopies << std::endl
@@ -158,21 +195,24 @@ bool RLGarbageCollector::shouldTriggerGC(uint32_t freeBlocks, uint64_t currentTi
 }
 
 uint32_t RLGarbageCollector::getGCAction(uint32_t freeBlocks) {
-  // Critical situation - force intensive GC
-  if (freeBlocks <= tigcThreshold) {
-    // Return maximum action (most aggressive GC)
+  // Check if we're in intensive mode
+  if (inIntensiveMode) {
+    // Increment intensive GC counter
     stats.intensiveGCCount++;
-    RL_DEBUG_LOG("[RL-GC ACTION] INTENSIVE GC: Using maximum action " 
-              << maxPageCopies << " due to critical free blocks (" 
-              << freeBlocks << " <= " << tigcThreshold << ")");
+    
+    // Return intensive action (more aggressive GC)
+    RL_DEBUG_LOG("[RL-GC ACTION] INTENSIVE GC: Using intensive action " 
+              << intensiveGCMaxPageCopies << " due to being in intensive mode, "
+              << freeBlocks << " free blocks, threshold: " << tigcThreshold
+              << ", total intensive GCs: " << stats.intensiveGCCount);
     
     // Store last action for next state
-    lastAction = maxPageCopies;
+    lastAction = intensiveGCMaxPageCopies;
     
     // Schedule pending update with current state and action
     schedulePendingUpdate(currentState, lastAction);
     
-    return maxPageCopies;
+    return intensiveGCMaxPageCopies;
   }
   
   // Get action from Q-table
@@ -264,10 +304,8 @@ void RLGarbageCollector::updateState(uint64_t currentTime) {
 }
 
 void RLGarbageCollector::recordResponseTime(uint64_t responseTime) {
-  // Safety check - ignore unreasonable response times
+  // Safety check - ignore unreasonably large values
   if (responseTime > UINT64_MAX / 2) {
-    RL_DEBUG_LOG("[RL-GC RESPONSE] Ignoring unreasonable response time: " 
-              << responseTime << "ns");
     return;
   }
   
@@ -279,13 +317,29 @@ void RLGarbageCollector::recordResponseTime(uint64_t responseTime) {
     responseTimes.pop_front();
   }
   
-  RL_DEBUG_LOG("[RL-GC RESPONSE] Recorded response time: " << responseTime 
-            << "ns, history size: " << responseTimes.size() << "/" 
-            << maxResponseTimes);
+  // Calculate average response time safely
+  double sum = 0.0;
+  for (uint64_t time : responseTimes) {
+    sum += static_cast<double>(time);
+  }
+  stats.avgResponseTime = sum / responseTimes.size();
+  
+  // Safety check - if the average is unreasonably large, cap it
+  if (stats.avgResponseTime > 1e16) {
+    stats.avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                          responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                          0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+  }
+  stats.responseTimeCount++;
   
   // Update percentile thresholds if we have enough data
   if (responseTimes.size() >= 100) {
     updatePercentileThresholds();
+  }
+  
+  // Output metrics periodically if enabled
+  if (metricsEnabled && stats.rewardCount % 1000 == 0 && stats.rewardCount > 0) {
+    outputMetricsToFile();
   }
 }
 
@@ -398,6 +452,26 @@ bool RLGarbageCollector::shouldPerformIntensiveGC(uint32_t freeBlocks) {
   return freeBlocks <= tigcThreshold;
 }
 
+bool RLGarbageCollector::shouldExitIntensiveMode(uint32_t freeBlocks) {
+  // Exit intensive mode when free blocks > tigcThreshold (default: 3)
+  return freeBlocks > tigcThreshold;
+}
+
+void RLGarbageCollector::setIntensiveMode(bool enable) {
+  if (enable && !inIntensiveMode) {
+    RL_DEBUG_LOG("Entering INTENSIVE GC mode with free blocks <= " << tigcThreshold);
+    inIntensiveMode = true;
+  }
+  else if (!enable && inIntensiveMode) {
+    RL_DEBUG_LOG("Exiting INTENSIVE GC mode with free blocks > " << tigcThreshold);
+    inIntensiveMode = false;
+  }
+}
+
+bool RLGarbageCollector::isInIntensiveMode() const {
+  return inIntensiveMode;
+}
+
 uint32_t RLGarbageCollector::discretizePrevInterval(uint64_t interval) {
   // 2 bins as per the paper: "short" if less than 100μs, or "long" otherwise
   if (interval < 100000) return 0;  // < 100μs (short)
@@ -462,12 +536,13 @@ const State& RLGarbageCollector::getCurrentState() const {
 }
 
 void RLGarbageCollector::getStats(uint64_t &invocations, uint64_t &pageCopies,
-                                 uint64_t &intensiveGCs, float &avgReward) {
+                                 uint64_t &intensiveGCs, float &avgReward, uint64_t &erases) {
   // Use a mutex or atomic operations if this is accessed from multiple threads
   invocations = stats.gcInvocations;
   pageCopies = stats.totalPageCopies;
   intensiveGCs = stats.intensiveGCCount;
   avgReward = stats.avgReward;
+  erases = stats.eraseCount;
 }
 
 void RLGarbageCollector::resetStats() {
@@ -476,6 +551,10 @@ void RLGarbageCollector::resetStats() {
   stats.intensiveGCCount = 0;
   stats.avgReward = 0.0f;
   stats.rewardCount = 0;
+  stats.eraseCount = 0;
+  
+  // Reset intensive mode
+  inIntensiveMode = false;
 }
 
 void RLGarbageCollector::printDebugInfo() const {
@@ -518,7 +597,23 @@ void RLGarbageCollector::recordGCInvocation(uint32_t copiedPages) {
 }
 
 void RLGarbageCollector::recordIntensiveGC() {
-  stats.intensiveGCCount++;
+  // Note: We don't increment the counter here anymore because we increment it in getGCAction
+  // This method is now used primarily to ensure we're in intensive mode and for logging
+  
+  // Ensure we're in intensive mode
+  if (!inIntensiveMode) {
+    setIntensiveMode(true);
+  }
+  
+  RL_DEBUG_LOG("[RL-GC STATS] Recorded intensive GC operation. Total intensive GCs: " 
+            << stats.intensiveGCCount << ", Intensive mode: " << (inIntensiveMode ? "ON" : "OFF"));
+}
+
+void RLGarbageCollector::recordBlockErase() {
+  stats.eraseCount++;
+  
+  RL_DEBUG_LOG("[RL-GC STATS] Recorded block erase. Total erases: " 
+            << stats.eraseCount);
 }
 
 void RLGarbageCollector::updatePercentileThresholds() {
@@ -599,12 +694,236 @@ float RLGarbageCollector::calculateReward(uint64_t responseTime) {
   }
   else {
     // Response time is above 99th percentile - very poor
-    reward = -1.0f;
+    reward = -0.5f;
     RL_DEBUG_LOG("[RL-GC REWARD] VERY POOR response time: " << responseTime 
               << "ns > t3(" << t3Threshold << "ns), reward=" << reward);
   }
   
   return reward;
+}
+
+void RLGarbageCollector::setMetricsFilePath(const std::string &basePath) {
+  metricsFilePath = basePath + "_metrics.txt";
+  
+  // Initialize metrics file
+  if (metricsEnabled) {
+    std::ofstream metricsFile(metricsFilePath, std::ios::trunc);
+    if (metricsFile.is_open()) {
+      metricsFile << "# RL-Baseline Metrics" << std::endl;
+      metricsFile << "# Format: <timestamp> <gc_invocations> <page_copies> <intensive_gc_count> <erases> <avg_reward> <avg_response_time> <p99_latency> <p99.9_latency> <p99.99_latency>" << std::endl;
+      metricsFile.close();
+    }
+    else {
+      std::cerr << "Warning: Failed to initialize RL-Baseline metrics file" << std::endl;
+    }
+  }
+}
+
+void RLGarbageCollector::outputMetricsToFile() {
+  if (!metricsEnabled) {
+    return;
+  }
+  
+  std::ofstream metricsFile(metricsFilePath, std::ios::app);
+  if (metricsFile.is_open()) {
+    // Calculate percentiles for latency reporting
+    uint64_t p99 = 0;
+    uint64_t p999 = 0;
+    uint64_t p9999 = 0;
+    double avgResponseTime = 0.0;
+    
+    if (responseTimes.size() >= 100) {
+      p99 = getLatencyPercentile(99.0f);
+      p999 = getLatencyPercentile(99.9f);
+      p9999 = getLatencyPercentile(99.99f);
+      
+      // Calculate average response time safely
+      double sum = 0.0;
+      for (uint64_t time : responseTimes) {
+        // Convert to double to avoid uint64_t overflow
+        sum += static_cast<double>(time);
+      }
+      avgResponseTime = sum / responseTimes.size();
+      
+      // Safety check - if the average is unreasonably large, cap it
+      if (avgResponseTime > 1e16) {
+        avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                       responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                       0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+      }
+    }
+    
+    // Write metrics line
+    metricsFile << currentRequestTime << " "
+                << stats.gcInvocations << " "
+                << stats.totalPageCopies << " "
+                << stats.intensiveGCCount << " "
+                << stats.eraseCount << " "
+                << std::fixed << std::setprecision(4) << stats.avgReward << " "
+                << std::fixed << std::setprecision(2) << avgResponseTime << " "
+                << p99 << " "
+                << p999 << " "
+                << p9999 << std::endl;
+    
+    metricsFile.close();
+  }
+  else {
+    std::cerr << "Warning: Failed to open RL-Baseline metrics file for writing" << std::endl;
+  }
+}
+
+void RLGarbageCollector::finalizeMetrics() {
+  if (!metricsEnabled) {
+    return;
+  }
+  
+  // Make sure to output the latest metrics
+  outputMetricsToFile();
+  
+  // Create a summary file
+  std::string summaryPath = metricsFilePath.substr(0, metricsFilePath.find("_metrics.txt")) + "_summary.txt";
+  std::ofstream summaryFile(summaryPath, std::ios::trunc);
+  
+  if (summaryFile.is_open()) {
+    // Calculate percentiles for final reporting
+    uint64_t p99 = 0;
+    uint64_t p999 = 0;
+    uint64_t p9999 = 0;
+    double avgResponseTime = 0.0;
+    
+    if (responseTimes.size() >= 100) {
+      p99 = getLatencyPercentile(99.0f);
+      p999 = getLatencyPercentile(99.9f);
+      p9999 = getLatencyPercentile(99.99f);
+      
+      // Calculate average response time safely
+      double sum = 0.0;
+      for (uint64_t time : responseTimes) {
+        // Convert to double to avoid uint64_t overflow
+        sum += static_cast<double>(time);
+      }
+      avgResponseTime = sum / responseTimes.size();
+      
+      // Safety check - if the average is unreasonably large, cap it
+      if (avgResponseTime > 1e16) {
+        avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                       responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                       0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+      }
+    }
+    
+    // Write summary header
+    if (metricsFilePath.find("intensive") != std::string::npos) {
+      summaryFile << "RL-Intensive GC Policy Summary Report" << std::endl;
+      summaryFile << "====================================" << std::endl;
+      if (inIntensiveMode) {
+        summaryFile << "Final Mode: Intensive GC mode (ended in intensive mode)" << std::endl;
+      } else {
+        summaryFile << "Final Mode: Normal mode (intensive mode was exited)" << std::endl;
+      }
+    } else {
+      summaryFile << "RL-Baseline Policy Summary Report" << std::endl;
+      summaryFile << "===========================" << std::endl;
+    }
+    summaryFile << std::endl;
+    
+    // Write simulation parameters
+    summaryFile << "Simulation Parameters:" << std::endl;
+    summaryFile << "---------------------" << std::endl;
+    summaryFile << "GC Threshold (TGC): " << tgcThreshold << " free blocks" << std::endl;
+    summaryFile << "Intensive GC Threshold (TIGC): " << tigcThreshold << " free blocks" << std::endl;
+    summaryFile << "Max Page Copies per GC: " << maxPageCopies << " pages" << std::endl;
+    summaryFile << "Q-learning Epsilon: " << qTable.getEpsilon() << std::endl;
+    summaryFile << std::endl;
+    
+    // Write GC statistics
+    summaryFile << "GC Statistics:" << std::endl;
+    summaryFile << "-------------" << std::endl;
+    summaryFile << "Total GC Invocations: " << stats.gcInvocations << std::endl;
+    summaryFile << "Total Pages Copied: " << stats.totalPageCopies << std::endl;
+    summaryFile << "Intensive GC Operations: " << stats.intensiveGCCount << std::endl;
+    
+    // Calculate percentage of intensive operations
+    if (stats.gcInvocations > 0) {
+      float intensivePercentage = (float)stats.intensiveGCCount * 100.0f / stats.gcInvocations;
+      summaryFile << "Intensive GC %: " << std::fixed << std::setprecision(2) << intensivePercentage << "%" << std::endl;
+    }
+    
+    summaryFile << "Average Pages per GC: " << (stats.gcInvocations > 0 ? 
+      ((float)stats.totalPageCopies / stats.gcInvocations) : 0.0f) << std::endl;
+    summaryFile << "Block Erasures: " << stats.eraseCount << std::endl;
+    summaryFile << std::endl;
+    
+    // Write RL-specific statistics
+    summaryFile << "RL Statistics:" << std::endl;
+    summaryFile << "-------------" << std::endl;
+    summaryFile << "Average Reward: " << std::fixed << std::setprecision(4) << stats.avgReward << std::endl;
+    summaryFile << "Total Reward Count: " << stats.rewardCount << std::endl;
+    summaryFile << std::endl;
+    
+    // Write performance statistics
+    summaryFile << "Performance Metrics:" << std::endl;
+    summaryFile << "-------------------" << std::endl;
+    summaryFile << "Average Response Time: " << std::fixed << std::setprecision(2) << avgResponseTime << " ns" << std::endl;
+    summaryFile << "P99 Latency: " << p99 << " ns" << std::endl;
+    summaryFile << "P99.9 Latency: " << p999 << " ns" << std::endl;
+    summaryFile << "P99.99 Latency: " << p9999 << " ns" << std::endl;
+    
+    // Add intensive GC-specific explanation if this is the intensive GC policy
+    if (metricsFilePath.find("intensive") != std::string::npos) {
+      summaryFile << std::endl;
+      summaryFile << "RL Intensive GC Policy Details:" << std::endl;
+      summaryFile << "----------------------------" << std::endl;
+      summaryFile << "The RL-Intensive GC policy aims to reduce long-tail latency by" << std::endl;
+      summaryFile << "performing more aggressive garbage collection when free blocks are critically low." << std::endl;
+      summaryFile << "Intensive mode activates when free blocks <= " << tigcThreshold << "." << std::endl;
+      summaryFile << "In intensive mode, GC operations copy " << intensiveGCMaxPageCopies << " pages per operation" << std::endl;
+      summaryFile << "instead of the 1-2 pages in normal mode, enabling faster reclamation of free blocks." << std::endl;
+    }
+    summaryFile << std::endl;
+    
+    // Additional metrics that are relevant according to the research paper
+    summaryFile << "Efficiency Metrics:" << std::endl;
+    summaryFile << "------------------" << std::endl;
+    float avgPagesPerGC = stats.gcInvocations > 0 ? (float)stats.totalPageCopies / stats.gcInvocations : 0;
+    summaryFile << "Average Pages Copied per GC: " << std::fixed << std::setprecision(2) << avgPagesPerGC << std::endl;
+    
+    summaryFile.close();
+    
+    std::cout << "RL-Baseline summary metrics saved to: " << summaryPath << std::endl;
+  }
+  else {
+    std::cerr << "Warning: Failed to open RL-Baseline summary file for writing" << std::endl;
+  }
+}
+
+uint64_t RLGarbageCollector::getLatencyPercentile(float percentile) const {
+  if (responseTimes.empty()) {
+    return 0;
+  }
+  
+  // Make a copy and sort
+  std::vector<uint64_t> sortedTimes(responseTimes.begin(), responseTimes.end());
+  std::sort(sortedTimes.begin(), sortedTimes.end());
+  
+  // For very high percentiles, we need to be more precise
+  // Calculate the exact position
+  float position = (sortedTimes.size() - 1) * percentile / 100.0f;
+  size_t idx = static_cast<size_t>(position);
+  
+  // Ensure we don't go out of bounds
+  if (idx >= sortedTimes.size() - 1) {
+    return sortedTimes.back(); // Return the maximum value
+  }
+  
+  // For very high percentiles, use linear interpolation between points
+  float fraction = position - idx;
+  if (fraction > 0 && idx < sortedTimes.size() - 1) {
+    return static_cast<uint64_t>(sortedTimes[idx] * (1 - fraction) + 
+                                 sortedTimes[idx + 1] * fraction);
+  }
+  
+  return sortedTimes[idx];
 }
 
 }  // namespace FTL

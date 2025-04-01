@@ -26,9 +26,11 @@
 
 #include "ftl/abstract_ftl.hh"
 #include "ftl/common/block.hh"
+#include "ftl/common/default_gc_metrics.hh"
 #include "ftl/ftl.hh"
 #include "pal/pal.hh"
-#include "ftl/rl_gc/rl_gc.hh"
+#include "ftl/rl_baseline_gc/rl_baseline.hh"
+#include "ftl/rl_aggressive_gc/rl_aggressive.hh"
 #include "ftl/lazy_rtgc/lazy_rtgc.hh"
 
 namespace SimpleSSD {
@@ -62,11 +64,16 @@ class PageMapping : public AbstractFTL {
   } stat;
 
   RLGarbageCollector *pRLGC;
+  RLAggressiveGarbageCollector *pRLAggressiveGC;
   bool bEnableRLGC;
   
   // Lazy-RTGC implementation
   LazyRTGC *pLazyRTGC;
   bool bEnableLazyRTGC;
+  
+  // Default GC Metrics implementation
+  DefaultGCMetrics *pDefaultGCMetrics;
+  bool bEnableDefaultGCMetrics;
   
   // Current active GC policy
   GC_POLICY activeGCPolicy;
@@ -81,7 +88,7 @@ class PageMapping : public AbstractFTL {
   uint32_t getLastFreeBlock(Bitset &);
   void calculateVictimWeight(std::vector<std::pair<uint32_t, float>> &,
                              const EVICT_POLICY, uint64_t);
-  void selectVictimBlock(std::vector<uint32_t> &, uint64_t &);
+  void selectVictimBlock(std::vector<uint32_t> &, uint64_t &, bool isEarlyGC = false, float invalidThreshold = 0.0);
   void doGarbageCollection(std::vector<uint32_t> &, uint64_t &);
 
   float calculateWearLeveling();
@@ -92,7 +99,7 @@ class PageMapping : public AbstractFTL {
   void trimInternal(Request &, uint64_t &);
   void eraseInternal(PAL::Request &, uint64_t &);
 
-  uint32_t performPartialGC(uint32_t pagesToCopy, std::vector<uint32_t> &victimBlocks, uint64_t &tick);
+  uint32_t performPartialGC(uint32_t pagesToCopy, std::vector<uint32_t> &victimBlocks, uint64_t &tick, bool isEarlyGC = false, float invalidThreshold = 0.0);
 
  public:
   PageMapping(ConfigReader &, Parameter &, PAL::PAL *, DRAM::AbstractDRAM *);

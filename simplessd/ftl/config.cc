@@ -56,6 +56,13 @@ const char NAME_LAZY_RTGC_THRESHOLD[] = "LazyRTGCThreshold";
 const char NAME_LAZY_RTGC_MAX_PAGE_COPIES[] = "LazyRTGCMaxPageCopies";
 const char NAME_LAZY_RTGC_METRICS_ENABLE[] = "LazyRTGCMetricsEnable";
 
+// RL-Aggressive GC configuration parameters
+const char NAME_RL_AGG_TAGC_THRESHOLD[] = "RLAggressiveTAGCThreshold";
+const char NAME_RL_AGG_MAX_GC_OPS[] = "RLAggressiveMaxGCOps";
+const char NAME_RL_AGG_READ_TRIGGERED_GC[] = "RLAggressiveReadTriggeredGC";
+const char NAME_RL_AGG_DEBUG_ENABLE[] = "RLAggressiveDebugEnable";
+const char NAME_RL_AGG_METRICS_ENABLE[] = "RLAggressiveMetricsEnable";
+
 Config::Config() {
   mapping = PAGE_MAPPING;
   overProvision = 0.25f;
@@ -89,6 +96,13 @@ Config::Config() {
   lazyRTGCThreshold = 10;      // Free block threshold for GC in Lazy-RTGC
   lazyRTGCMaxPageCopies = 3;   // Max pages to copy per GC op in Lazy-RTGC
   lazyRTGCMetricsEnable = true;  // Enable metrics collection by default
+  
+  // RL-Aggressive GC parameters
+  rlAggTAGCThreshold = 100;         // TAGC threshold from paper (100)
+  rlAggMaxGCOps = 2;                // Maximum GC operations when between TAGC and TGC (2)
+  rlAggReadTriggeredGC = true;      // Enable read-triggered GC
+  rlAggDebugEnable = false;         // Disable debug output by default
+  rlAggMetricsEnable = true;        // Enable metrics collection by default
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -172,6 +186,21 @@ bool Config::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_LAZY_RTGC_METRICS_ENABLE)) {
     lazyRTGCMetricsEnable = convertBool(value);
   }
+  else if (MATCH_NAME(NAME_RL_AGG_TAGC_THRESHOLD)) {
+    rlAggTAGCThreshold = (uint32_t)strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_RL_AGG_MAX_GC_OPS)) {
+    rlAggMaxGCOps = (uint32_t)strtoul(value, nullptr, 0);
+  }
+  else if (MATCH_NAME(NAME_RL_AGG_READ_TRIGGERED_GC)) {
+    rlAggReadTriggeredGC = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_RL_AGG_DEBUG_ENABLE)) {
+    rlAggDebugEnable = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_RL_AGG_METRICS_ENABLE)) {
+    rlAggMetricsEnable = convertBool(value);
+  }
   else {
     ret = false;
   }
@@ -252,6 +281,12 @@ uint64_t Config::readUint(uint32_t idx) {
     case FTL_LAZY_RTGC_MAX_PAGE_COPIES:
       ret = lazyRTGCMaxPageCopies;
       break;
+    case FTL_RL_AGG_TAGC_THRESHOLD:
+      ret = rlAggTAGCThreshold;
+      break;
+    case FTL_RL_AGG_MAX_GC_OPS:
+      ret = rlAggMaxGCOps;
+      break;
   }
 
   return ret;
@@ -305,6 +340,15 @@ bool Config::readBoolean(uint32_t idx) {
       break;
     case FTL_LAZY_RTGC_METRICS_ENABLE:
       ret = lazyRTGCMetricsEnable;
+      break;
+    case FTL_RL_AGG_READ_TRIGGERED_GC:
+      ret = rlAggReadTriggeredGC;
+      break;
+    case FTL_RL_AGG_DEBUG_ENABLE:
+      ret = rlAggDebugEnable;
+      break;
+    case FTL_RL_AGG_METRICS_ENABLE:
+      ret = rlAggMetricsEnable;
       break;
   }
 

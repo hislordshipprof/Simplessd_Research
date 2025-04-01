@@ -36,7 +36,7 @@ LazyRTGC::LazyRTGC(uint32_t gcThresh, uint32_t maxCopies)
       maxPageCopiesPerGC(maxCopies),
       lastRequestTime(0),
       currentRequestTime(0),
-      maxResponseTimes(10000),  // Track up to 10000 response times for accurate percentiles
+      maxResponseTimes(1000),  // Track up to 1000 response times for consistency with other policies
       metricsEnabled(false),
       metricsFilePath("output/lazy_rtgc_metrics.txt") {
   
@@ -110,8 +110,10 @@ uint32_t LazyRTGC::getMaxPageCopies() const {
 
 // Update read latency statistics
 void LazyRTGC::updateReadLatencyStats(uint64_t responseTime) {
-  // According to our research paper, we track read latencies separately
-  // to analyze tail latency effects on read operations
+  // Safety check - ignore unreasonably large values
+  if (responseTime > UINT64_MAX / 2) {
+    return;
+  }
   
   // Add to response time history
   responseTimes.push_back(responseTime);
@@ -121,22 +123,33 @@ void LazyRTGC::updateReadLatencyStats(uint64_t responseTime) {
     responseTimes.pop_front();
   }
   
-  // Update average response time
-  stats.avgResponseTime = 
-      (stats.avgResponseTime * stats.responseTimeCount + responseTime) / 
-      (stats.responseTimeCount + 1);
+  // Calculate average response time safely
+  double sum = 0.0;
+  for (uint64_t time : responseTimes) {
+    sum += static_cast<double>(time);
+  }
+  stats.avgResponseTime = sum / responseTimes.size();
+  
+  // Safety check - if the average is unreasonably large, cap it
+  if (stats.avgResponseTime > 1e16) {
+    stats.avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                          responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                          0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+  }
   stats.responseTimeCount++;
   
   // If metrics are enabled and we've collected enough samples, output metrics periodically
   if (metricsEnabled && (stats.responseTimeCount % 1000 == 0)) {
-    outputMetricsToFile(); // Reinstate periodic output call
+    outputMetricsToFile();
   }
 }
 
 // Update write latency statistics
 void LazyRTGC::updateWriteLatencyStats(uint64_t responseTime) {
-  // According to our research paper, we track write latencies as well
-  // even though they're usually not as critical for tail latency
+  // Safety check - ignore unreasonably large values
+  if (responseTime > UINT64_MAX / 2) {
+    return;
+  }
   
   // Add to response time history
   responseTimes.push_back(responseTime);
@@ -146,14 +159,20 @@ void LazyRTGC::updateWriteLatencyStats(uint64_t responseTime) {
     responseTimes.pop_front();
   }
   
-  // Update average response time
-  stats.avgResponseTime = 
-      (stats.avgResponseTime * stats.responseTimeCount + responseTime) / 
-      (stats.responseTimeCount + 1);
-  stats.responseTimeCount++;
+  // Calculate average response time safely
+  double sum = 0.0;
+  for (uint64_t time : responseTimes) {
+    sum += static_cast<double>(time);
+  }
+  stats.avgResponseTime = sum / responseTimes.size();
   
-  // Write operations don't trigger metrics output since they occur more
-  // frequently and would cause too many file writes
+  // Safety check - if the average is unreasonably large, cap it
+  if (stats.avgResponseTime > 1e16) {
+    stats.avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                          responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                          0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+  }
+  stats.responseTimeCount++;
 }
 
 // Record GC invocation statistics
@@ -185,7 +204,23 @@ void LazyRTGC::getStats(uint64_t &invocations, uint64_t &pageCopies,
   pageCopies = stats.totalPageCopies;
   validCopies = stats.validPageCopies;
   erases = stats.eraseCount;
-  avgResponse = stats.avgResponseTime;
+  
+  // Calculate average response time on-demand
+  avgResponse = 0.0f;
+  if (!responseTimes.empty()) {
+    double sum = 0.0;
+    for (uint64_t time : responseTimes) {
+      sum += static_cast<double>(time);
+    }
+    avgResponse = static_cast<float>(sum / responseTimes.size());
+    
+    // Safety check for unreasonable values
+    if (avgResponse > 1e16f) {
+      avgResponse = static_cast<float>(std::accumulate(responseTimes.begin(), 
+                                                    responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                                    0.0) / std::min(static_cast<size_t>(100), responseTimes.size()));
+    }
+  }
 }
 
 // Reset statistics
@@ -194,7 +229,6 @@ void LazyRTGC::resetStats() {
   stats.totalPageCopies = 0;
   stats.validPageCopies = 0;
   stats.eraseCount = 0;
-  stats.avgResponseTime = 0.0f;
   stats.responseTimeCount = 0;
   
   // Clear response times
@@ -208,8 +242,27 @@ void LazyRTGC::printStats() const {
   std::cout << "Total Page Copies: " << stats.totalPageCopies << std::endl;
   std::cout << "Valid Page Copies: " << stats.validPageCopies << std::endl;
   std::cout << "Block Erases: " << stats.eraseCount << std::endl;
+  
+  double avgResponseTime = 0.0;
+  
+  // Calculate average response time if we have data
+  if (!responseTimes.empty()) {
+    double sum = 0.0;
+    for (uint64_t time : responseTimes) {
+      sum += static_cast<double>(time);
+    }
+    avgResponseTime = sum / responseTimes.size();
+    
+    // Safety check for unreasonable values
+    if (avgResponseTime > 1e16) {
+      avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                      responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                      0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+    }
+  }
+  
   std::cout << "Average Response Time: " << std::fixed << std::setprecision(2) 
-            << stats.avgResponseTime << " ns" << std::endl;
+            << avgResponseTime << " ns" << std::endl;
   
   // Calculate and print percentiles if we have enough data
   if (responseTimes.size() >= 100) {
@@ -232,20 +285,36 @@ void LazyRTGC::outputMetricsToFile() {
     uint64_t p99 = 0;
     uint64_t p999 = 0;
     uint64_t p9999 = 0;
+    double avgResponseTime = 0.0;
     
     if (responseTimes.size() >= 100) {
       p99 = getLatencyPercentile(99.0f);
       p999 = getLatencyPercentile(99.9f);
       p9999 = getLatencyPercentile(99.99f);
+      
+      // Calculate average response time safely
+      double sum = 0.0;
+      for (uint64_t time : responseTimes) {
+        // Convert to double to avoid uint64_t overflow
+        sum += static_cast<double>(time);
+      }
+      avgResponseTime = sum / responseTimes.size();
+      
+      // Safety check - if the average is unreasonably large, cap it
+      if (avgResponseTime > 1e16) {
+        avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                       responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                       0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+      }
     }
     
-    // Write metrics line - output 0 for valid_copies
+    // Write metrics line
     metricsFile << currentRequestTime << " "
                 << stats.gcInvocations << " "
                 << stats.totalPageCopies << " "
                 << 0 << " " // Placeholder for valid_copies
                 << stats.eraseCount << " "
-                << std::fixed << std::setprecision(2) << stats.avgResponseTime << " "
+                << std::fixed << std::setprecision(2) << avgResponseTime << " "
                 << p99 << " "
                 << p999 << " "
                 << p9999 << std::endl;
@@ -272,11 +341,27 @@ void LazyRTGC::finalizeMetrics() {
     uint64_t p99 = 0;
     uint64_t p999 = 0;
     uint64_t p9999 = 0;
+    double avgResponseTime = 0.0;
     
     if (responseTimes.size() >= 100) {
       p99 = getLatencyPercentile(99.0f);
       p999 = getLatencyPercentile(99.9f);
       p9999 = getLatencyPercentile(99.99f);
+      
+      // Calculate average response time safely
+      double sum = 0.0;
+      for (uint64_t time : responseTimes) {
+        // Convert to double to avoid uint64_t overflow
+        sum += static_cast<double>(time);
+      }
+      avgResponseTime = sum / responseTimes.size();
+      
+      // Safety check - if the average is unreasonably large, cap it
+      if (avgResponseTime > 1e16) {
+        avgResponseTime = std::accumulate(responseTimes.begin(), 
+                                       responseTimes.begin() + std::min(static_cast<size_t>(100), responseTimes.size()), 
+                                       0.0) / std::min(static_cast<size_t>(100), responseTimes.size());
+      }
     }
     
     // Write summary header
@@ -304,7 +389,7 @@ void LazyRTGC::finalizeMetrics() {
     // Write performance statistics
     summaryFile << "Performance Metrics:" << std::endl;
     summaryFile << "-------------------" << std::endl;
-    summaryFile << "Average Response Time: " << std::fixed << std::setprecision(2) << stats.avgResponseTime << " ns" << std::endl;
+    summaryFile << "Average Response Time: " << std::fixed << std::setprecision(2) << avgResponseTime << " ns" << std::endl;
     summaryFile << "P99 Latency: " << p99 << " ns" << std::endl;
     summaryFile << "P99.9 Latency: " << p999 << " ns" << std::endl;
     summaryFile << "P99.99 Latency: " << p9999 << " ns" << std::endl;
@@ -351,10 +436,23 @@ uint64_t LazyRTGC::getLatencyPercentile(float percentile) const {
   std::vector<uint64_t> sortedTimes(responseTimes.begin(), responseTimes.end());
   std::sort(sortedTimes.begin(), sortedTimes.end());
   
-  // Calculate index for percentile
-  size_t idx = static_cast<size_t>(sortedTimes.size() * percentile / 100.0f);
-  if (idx >= sortedTimes.size()) {
-    idx = sortedTimes.size() - 1;
+  // Normalize percentile to 0.0-1.0 range
+  float normalizedPercentile = percentile / 100.0f;
+  
+  // Calculate the exact position for precise interpolation
+  float position = (sortedTimes.size() - 1) * normalizedPercentile;
+  size_t idx = static_cast<size_t>(position);
+  
+  // Ensure we don't go out of bounds
+  if (idx >= sortedTimes.size() - 1) {
+    return sortedTimes.back(); // Return the maximum value
+  }
+  
+  // Use linear interpolation for fractional positions
+  float fraction = position - idx;
+  if (fraction > 0 && idx < sortedTimes.size() - 1) {
+    return static_cast<uint64_t>(sortedTimes[idx] * (1 - fraction) + 
+                               sortedTimes[idx + 1] * fraction);
   }
   
   return sortedTimes[idx];

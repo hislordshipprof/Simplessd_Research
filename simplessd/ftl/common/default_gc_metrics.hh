@@ -17,8 +17,8 @@
  * along with SimpleSSD.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef __SIMPLESSD_FTL_LAZY_RTGC_HH__
-#define __SIMPLESSD_FTL_LAZY_RTGC_HH__
+#ifndef __SIMPLESSD_FTL_COMMON_DEFAULT_GC_METRICS_HH__
+#define __SIMPLESSD_FTL_COMMON_DEFAULT_GC_METRICS_HH__
 
 #include <deque>
 #include <vector>
@@ -31,15 +31,11 @@ namespace SimpleSSD {
 namespace FTL {
 
 /**
- * Lazy-RTGC (Real-Time Garbage Collection) Controller
- * Based on the approach described in the Lazy-RTGC paper
+ * DefaultGCMetrics
+ * Collects and manages metrics for the default page-level mapping policy
  */
-class LazyRTGC {
+class DefaultGCMetrics {
  private:
-  // GC parameters
-  uint32_t gcThreshold;         // Free block threshold for GC triggering
-  uint32_t maxPageCopiesPerGC;  // Maximum page copies per GC operation
-  
   // Time tracking
   uint64_t lastRequestTime;     // Time of the last request
   uint64_t currentRequestTime;  // Time of the current request
@@ -54,8 +50,8 @@ class LazyRTGC {
     uint64_t totalPageCopies;     // Total pages copied during GC
     uint64_t validPageCopies;     // Valid pages copied during GC
     uint64_t eraseCount;          // Number of block erasures
+    float avgResponseTime;        // Average response time
     uint64_t responseTimeCount;   // Number of response times recorded
-    double avgResponseTime;      // Running average response time using EMA
   } stats;
   
   // Metrics output
@@ -63,24 +59,16 @@ class LazyRTGC {
   std::string metricsFilePath;
   
   // Helper functions
-  void updatePercentileThresholds();
   uint64_t getLatencyPercentile(float percentile) const;
   
  public:
-  LazyRTGC(uint32_t gcThresh, uint32_t maxCopies);
-  ~LazyRTGC();
+  DefaultGCMetrics();
+  ~DefaultGCMetrics();
   
   // Core methods
-  bool shouldTriggerGC(uint32_t freeBlocks);
-  uint32_t getMaxPageCopies() const;
-  void updateReadLatencyStats(uint64_t responseTime);
-  void updateWriteLatencyStats(uint64_t responseTime);
-  void recordGCInvocation(uint32_t copiedPages);
+  void recordResponseTime(uint64_t responseTime);
+  void recordGCInvocation(uint32_t copiedPages, uint32_t validCopies);
   void recordBlockErase();
-  
-  // Getters
-  uint32_t getGCThreshold() const;
-  uint32_t getMaxPageCopiesPerGC() const;
   
   // Statistics
   void getStats(uint64_t &invocations, uint64_t &pageCopies, 
@@ -103,4 +91,4 @@ class LazyRTGC {
 
 }  // namespace SimpleSSD
 
-#endif  // __SIMPLESSD_FTL_LAZY_RTGC_HH__
+#endif

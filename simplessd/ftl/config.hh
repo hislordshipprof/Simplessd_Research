@@ -64,6 +64,13 @@ typedef enum {
   FTL_LAZY_RTGC_THRESHOLD,       // Free block threshold for Lazy-RTGC
   FTL_LAZY_RTGC_MAX_PAGE_COPIES, // Maximum page copies per GC operation
   FTL_LAZY_RTGC_METRICS_ENABLE,  // Enable metrics output for Lazy-RTGC
+  
+  /* RL-Aggressive GC Configuration */
+  FTL_RL_AGG_TAGC_THRESHOLD,       // Triggering aggressive GC threshold (100)
+  FTL_RL_AGG_MAX_GC_OPS,           // Maximum GC operations when between TAGC and TGC (2)
+  FTL_RL_AGG_READ_TRIGGERED_GC,     // Enable read-triggered GC
+  FTL_RL_AGG_DEBUG_ENABLE,          // Enable debug output
+  FTL_RL_AGG_METRICS_ENABLE,        // Enable metrics collection
 } FTL_CONFIG;
 
 typedef enum {
@@ -130,6 +137,13 @@ class Config : public BaseConfig {
   uint32_t lazyRTGCThreshold;       //!< Default: 10
   uint32_t lazyRTGCMaxPageCopies; //!< Default: 3
   bool lazyRTGCMetricsEnable;     //!< Default: true
+  
+  // RL-Aggressive GC parameters
+  uint32_t rlAggTAGCThreshold;      //!< Default: 100 (TAGC value)
+  uint32_t rlAggMaxGCOps;           //!< Default: 2 (max GC operations)
+  bool rlAggReadTriggeredGC;        //!< Default: true
+  bool rlAggDebugEnable;            //!< Default: false
+  bool rlAggMetricsEnable;          //!< Default: true
 
  public:
   Config();
