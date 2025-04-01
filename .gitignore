@@ -110,7 +110,7 @@ $RECYCLE.BIN/
 .nfs*
 
 # SimpleSSD specific files
-/output/
+#/output/
 *.log
 *.txt
 *.csv
@@ -129,3 +129,10 @@ vgcore.*
 *.swo
 *.tmp
 *.bak
+traces/
+output/
+results/
+RL_extracted_clean.md
+Lazy_RTGC.md
+README_analysis.md
+.cursor
